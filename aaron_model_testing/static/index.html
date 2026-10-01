@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Aaron Model Testing</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#leaderboard"
+        ><span class="brand-mark">A<span>↗</span></span
+        ><span>Aaron<br /><small>MODEL TESTING</small></span></a
+      >
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav>
+        <a href="#leaderboard" data-view="leaderboard"
+          >◈ <span>Leaderboard</span></a
+        >
+        <a href="#models" data-view="models">▦ <span>Models</span></a>
+        <a href="#compare" data-view="compare">⇄ <span>Compare</span></a>
+        <a href="#runs" data-view="runs">◷ <span>Runs</span></a>
+        <a href="#tests" data-view="tests">✓ <span>Tests</span></a>
+        <a href="#settings" data-view="settings">⚙ <span>Settings</span></a>
+      </nav>
+      <div class="sidebar-foot">
+        <div><i class="dot"></i> LOCAL WORKSPACE</div>
+        <p>Windows · AMD Vulkan<br />One inference lane · v0.1</p>
+        <span>Benchmark endpoint :1235</span>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">LOCAL MODEL LAB</span
+          ><span class="topnote">Speed. Capability. Reliability.</span>
+        </div>
+        <button class="primary" id="new-run">+ New benchmark</button>
+      </header>
+      <div id="job-strip" aria-live="polite"></div>
+      <section id="content"></section>
+    </main>
+    <dialog id="modal">
+      <div class="dialog-head">
+        <h2 id="modal-title"></h2>
+        <button id="close-modal" aria-label="Close">×</button>
+      </div>
+      <div id="modal-body"></div>
+    </dialog>
+    <div id="toast" role="status"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

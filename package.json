@@ -1,0 +1,13 @@
+{
+  "name": "aaron-model-testing-ui-checks",
+  "private": true,
+  "type": "module",
+  "description": "Optional DOM integration checks; the shipped UI requires no Node runtime or build step",
+  "scripts": {
+    "test:ui": "node tests/frontend.mjs"
+  },
+  "devDependencies": {
+    "happy-dom": "20.14.5",
+    "prettier": "3.9.9"
+  }
+}
