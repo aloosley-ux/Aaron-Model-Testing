@@ -2,6 +2,8 @@
 
 The unit of evaluation is a model fingerprint and saved runtime/sampling profile on a fingerprinted machine/build. Models can use different supported runtime flags. Definitions, scoring, repetition and measurement scope remain controlled. Profile names are intentions, not intelligence labels.
 
+The P0 evidence pass adds separately versioned diagnostics, active/queue/phase duration and efficiency without changing this frozen scoring methodology. Optimisation objectives are explicit and use a separate unscored guardrail. See [evidence and optimisation](EVIDENCE.md) for coverage, percentile, failure taxonomy, denominator and backward-read rules. Partial evidence is diagnostic and excluded from completed qualification leaderboards/comparability.
+
 ## Identity
 
 GGUF hashes read all bytes. Split identity is the SHA256 of ordered shard-hash JSON, explicitly labelled; every shard hash is retained. Parameter counts come from tensor dimensions and can include embedding/tied-weight representation differences. Filename quantisation is shown with raw file-type metadata. Context capability is declared metadata, not measured success. Auxiliary files are inventoried without text scoring.

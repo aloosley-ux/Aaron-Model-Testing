@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings, data_home, load_settings
+from .evidence import diagnose, eligible, enrich_summary, present_record
 from .pipeline import JobManager, RunRequest
 from .profiles import ProfileRequest
 from .runtime import environment, probe, server_command
@@ -227,6 +228,7 @@ def create_app(home: Path | None = None):
     legacy_cache = {}
 
     def presentation(record):
+        record = present_record(record)
         # Read-only warning for preserved historical grades affected by embedded thinking.
         if record.get("benchmark", {}).get("id") != "agent-core-v1" or not record.get("summary", {}).get(
             "capability_samples"
@@ -303,6 +305,13 @@ def create_app(home: Path | None = None):
                 for line in f:
                     try:
                         sample = json.loads(line)
+                        if "diagnostics" not in sample and sample.get("type") in (
+                            "capability",
+                            "performance",
+                            "tuning_performance",
+                            "tuning_guardrail",
+                        ):
+                            sample["diagnostics"] = diagnose(sample)
                         if (
                             record.get("benchmark", {}).get("id") == "agent-core-v1"
                             and sample.get("type") == "capability"
@@ -337,6 +346,7 @@ def create_app(home: Path | None = None):
                             "An incomplete JSONL record was found after interrupted writing"
                         )
         record["records"] = records
+        record["summary"] = enrich_summary(record["summary"], records, record)
         return record
 
     @app.get("/api/runs/{run_id}/responses/{sample_id}")
@@ -374,7 +384,7 @@ def create_app(home: Path | None = None):
     def leaderboard():
         output, seen = [], set()
         for r in sorted(app.state.store.all("runs"), key=lambda r: r["created_at"], reverse=True):
-            if r["status"] not in ("completed", "partial") or r["smoke"] or r["stage"] == "optimise":
+            if not eligible(r):
                 continue
             key = (r["model"]["sha256"], r["profile"]["config_sha256"], r.get("comparability_group"))
             if key in seen:
@@ -392,6 +402,8 @@ def create_app(home: Path | None = None):
                     "profile_id": r["profile"]["id"],
                     "quantisation": r["model"]["quantisation"],
                     "status": r["status"],
+                    "timing": r["timing"],
+                    "qualification_eligible": True,
                     "summary": r["summary"],
                     "request": r["request"],
                     "created_at": r["created_at"],
@@ -409,10 +421,13 @@ def create_app(home: Path | None = None):
             raise ValueError("Select 2–6 run IDs")
         records = [get("runs", v) for v in values]
         groups = {r.get("comparability_group") for r in records}
+        completed = all(eligible(r) for r in records)
         return {
-            "comparable": len(groups) == 1 and None not in groups,
+            "comparable": completed and len(groups) == 1 and None not in groups,
             "warning": None
-            if len(groups) == 1 and None not in groups
+            if completed and len(groups) == 1 and None not in groups
+            else "Partial, smoke or optimisation evidence is diagnostic only; excluded from completed qualifications"
+            if not completed
             else "Workload, build or machine differs; interpret comparison with care",
             "runs": [run_brief(r) for r in records],
         }

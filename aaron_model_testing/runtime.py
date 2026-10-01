@@ -16,6 +16,7 @@ import psutil
 
 from . import __version__
 from .config import Settings
+from .evidence import native_metrics
 from .processes import OwnedProcess, Telemetry
 from .profiles import RuntimeConfig
 from .util import command_text, digest, file_hash, write_json
@@ -281,6 +282,7 @@ class NativeServer:
         usage, timings, finish_reason = {}, {}, None
         start = time.perf_counter()
         deadline = time.monotonic() + self.settings.request_timeout
+        error, error_kind = None, None
         try:
             with self.client.stream(
                 "POST", "/v1/chat/completions" if chat else "/completion", json=body
@@ -303,10 +305,13 @@ class NativeServer:
                     delta = (event.get("choices") or [{}])[0].get("delta", {}) if chat else event
                     content = delta.get("content") or ""
                     thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if not isinstance(content, str) or not isinstance(thought, str):
+                        raise TypeError("Non-string content in native stream")
                     if content or thought or delta.get("tool_calls"):
                         first = elapsed if first is None else first
-                    if content:
+                    if content or delta.get("tool_calls"):
                         answer_first = elapsed if answer_first is None else answer_first
+                    if content:
                         text.append(content)
                     reasoning.append(thought)
                     for call in delta.get("tool_calls", []):
@@ -318,26 +323,31 @@ class NativeServer:
                             target["id"] = call["id"]
                         for key in ("name", "arguments"):
                             target["function"][key] += call.get("function", {}).get(key, "")
-                    usage = event.get("usage") or usage
-                    timings = event.get("timings") or timings
+                    if event.get("usage"):
+                        usage.update(event["usage"])
+                    if event.get("timings"):
+                        timings.update(event["timings"])
                     finish_reason = (event.get("choices") or [{}])[0].get("finish_reason") or finish_reason
                     if not chat and event.get("stop"):
                         finish_reason = "length" if event.get("stopped_limit") else "stop"
         except Exception as exc:
-            # Preserve partial streams on failure rather than silently dropping the response.
-            return {
-                "response": "".join(text),
-                "reasoning": "".join(reasoning),
-                "events": events,
-                "request": body,
-                "error": str(exc),
-                "latency_ms": (time.perf_counter() - start) * 1000,
-                "ttft_ms": first,
-                "success": False,
-                "tool_calls": list(tool_calls.values()),
-            }
-        predicted = timings.get("predicted_n") or usage.get("completion_tokens")
-        prompt_n = timings.get("prompt_n") or usage.get("prompt_tokens")
+            # Preserve counters, stop state and timings already received, including on cancellation.
+            error = str(exc)
+            error_kind = (
+                "cancelled"
+                if self.cancel.is_set() or isinstance(exc, InterruptedError)
+                else "timeout"
+                if isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                else "parser_or_harness_error"
+                if isinstance(exc, (json.JSONDecodeError, TypeError, KeyError, AttributeError))
+                else "inference_error"
+            )
+        counts = native_metrics(usage, timings)
+        predicted = counts["output_tokens"]
+        success = bool(error is None and predicted and (text or reasoning or tool_calls))
+        if error is None and not success:
+            error = "No server token count returned" if predicted is None else "Empty response"
+            error_kind = "inference_error"
         # Native timing is decode throughput. Never count SSE chunks as tokens.
         return {
             "response": "".join(text),
@@ -348,17 +358,17 @@ class NativeServer:
             "usage": usage,
             "native_timings": timings,
             "metrics": {
+                **counts,
                 "generation_tps": timings.get("predicted_per_second"),
                 "prompt_tps": timings.get("prompt_per_second"),
-                "output_tokens": predicted,
-                "input_tokens": prompt_n,
                 "ttft_ms": first,
                 "ttfa_ms": answer_first,
                 "latency_ms": (time.perf_counter() - start) * 1000,
             },
             "finish_reason": finish_reason,
-            "success": bool(predicted and (text or reasoning or tool_calls)),
-            "error": None if predicted else "No server token count returned",
+            "success": success,
+            "error": error,
+            "error_kind": error_kind,
         }
 
 

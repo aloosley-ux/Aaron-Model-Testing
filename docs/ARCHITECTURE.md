@@ -12,6 +12,7 @@ One FastAPI process serves static assets and REST on loopback 4321. A single in-
 | `pipeline.py` | Plans, repeats, warmups, matrix, cancellation, optimisation, profiles and durable artifacts. |
 | `scoring.py`, `codecheck.py` | Deterministic schema/tool checks and budgeted AST unit cases; no host eval/exec. |
 | `suite.py`, `benchmarks/` | Frozen v1 definitions/scorers/generators/workload hashes and change detection. |
+| `evidence.py`, `tuning_guardrails.py` | Additive versioned native timing/token diagnostics around frozen grades; distinct unscored optimisation guardrails. |
 | `store.py` | Separate SQLite connections, short transactions, file-first writes, recovery/reindex. |
 | `app.py`, `static/` | Loopback/origin checks, queue controls, history/comparison/inspection and offline SVG charts. |
 

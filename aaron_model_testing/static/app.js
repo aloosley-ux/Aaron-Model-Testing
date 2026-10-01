@@ -33,6 +33,7 @@ const state = {
   polling: false,
   openRun: null,
   followJob: null,
+  comparisonSort: "active_seconds",
 };
 function qualification(r) {
   const kind = r.request?.qualification || r.qualification || "custom";
@@ -52,7 +53,104 @@ function qualification(r) {
 function duration(seconds) {
   if (seconds == null) return "—";
   seconds = Math.max(0, Math.round(seconds));
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s`;
+  return `${seconds >= 3600 ? Math.floor(seconds / 3600) + "h " : ""}${seconds >= 60 ? Math.floor((seconds % 3600) / 60) + "m " : ""}${seconds % 60}s`;
+}
+const available = (v, unit = "") =>
+  v == null ? "Unavailable" : `${num(v)}${unit}`;
+function sampleEvidence(e = {}) {
+  return table(
+    ["Evidence", "Measured value"],
+    [
+      ["Sample wall-clock", available(e.sample_duration_ms, " ms")],
+      ["Input / prompt tokens", available(e.input_tokens)],
+      ["Output / generated tokens", available(e.output_tokens)],
+      ["Reasoning tokens (native)", available(e.reasoning_tokens)],
+      ["Final-answer tokens (native)", available(e.final_answer_tokens)],
+      ["TTFT", available(e.ttft_ms, " ms")],
+      ["TTFA", available(e.ttfa_ms, " ms")],
+      ["Generation duration", available(e.generation_duration_ms, " ms")],
+      ["Inference duration", available(e.inference_duration_ms, " ms")],
+      ["Stop reason", esc(e.finish_reason || "Unavailable")],
+      [
+        "Token-budget truncation",
+        e.truncated == null ? "Unavailable" : e.truncated ? "Yes" : "No",
+      ],
+      ["Failure reason", esc(e.failure_reason || "None")],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`),
+  );
+}
+function efficiencyPanel(r) {
+  const s = r.summary || {},
+    t = r.timing || {},
+    e = s.efficiency || {};
+  const label =
+    r.status === "completed"
+      ? "Completed evidence"
+      : "PARTIAL evidence · ineligible for completed qualification";
+  return `<div class="panel"><h2>Duration and task efficiency</h2><p>${esc(label)}</p>${table(
+    ["Metric", "Value"],
+    [
+      ["Active duration", duration(t.active_seconds)],
+      ["Queue wait", duration(t.queue_wait_seconds)],
+      ["Total elapsed", duration(t.total_elapsed_seconds)],
+      ["Samples / minute", available(e.samples_per_minute)],
+      [
+        "Capability samples / minute",
+        available(e.capability_samples_per_minute),
+      ],
+      [
+        "Correct capability samples / minute",
+        available(e.correct_capability_samples_per_minute),
+      ],
+      ["Output tokens / minute", available(e.output_tokens_per_minute)],
+      [
+        "Output tokens / correct capability answer",
+        available(e.output_tokens_per_correct_answer),
+      ],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`),
+  )}<p class="small muted">Rates use active duration including setup; queue wait is excluded. Diagnostic efficiency does not replace capability score. ${t.source === "timestamps" || t.source === "inference_timestamps" ? "Historical duration derived from timestamps; phase timing unavailable." : ""}</p><h3>Phase durations</h3>${table(
+    ["Phase", "Duration"],
+    Object.entries(t.phases || {}).map(
+      ([k, v]) =>
+        `<tr><td>${esc(k.replaceAll("_", " "))}</td><td>${duration(v)}</td></tr>`,
+    ),
+  )}<h3>Token usage</h3>${table(
+    ["Native count", "Observed total", "Coverage"],
+    Object.entries(s.tokens || {}).map(
+      ([k, v]) =>
+        `<tr><td>${esc(k.replaceAll("_", " "))}</td><td>${available(v.total)}</td><td>${v.observed_samples} / ${v.samples}${v.complete ? "" : " · incomplete / unavailable"}</td></tr>`,
+    ),
+  )}<p class="small muted">Reasoning and final-answer splits are shown only when reported natively; no token counts are inferred from text or stream chunks.</p>${table(
+    ["Capability distribution", "Median", "p95", "Observed samples"],
+    [
+      ["Response length (output tokens)", s.capability_response_tokens],
+      ["Sample duration (ms)", s.capability_sample_duration_ms],
+    ].map(
+      ([k, v]) =>
+        `<tr><td>${k}</td><td>${available(v?.median)}</td><td>${available(v?.p95)}</td><td>${num(v?.n, 0)}</td></tr>`,
+    ),
+  )}<h3>Capability failures by reason</h3>${table(
+    ["Reason", "Samples"],
+    Object.entries(s.failure_reasons || {}).map(
+      ([k, v]) => `<tr><td>${esc(k)}</td><td>${v}</td></tr>`,
+    ),
+  )}</div>`;
+}
+function optimisationPanel(report) {
+  if (!report) return "";
+  return `<div class="panel"><h2>Optimisation report</h2><p><strong>${esc(report.objective)}</strong> · ${report.partial ? "PARTIAL" : "Completed"} · ${esc(report.winner_kind?.replaceAll("_", " "))} · ${report.candidates_tested} / ${report.candidates_planned} candidates · ${report.rejected_candidates} rejected</p><p>${esc(report.selection_rule)}</p><p>Measured runtime score improvement: ${available(report.runtime_score_improvement_percent, "%")} (${esc(report.runtime_score_unit)})</p><p>Contexts: ${esc(report.contexts_tested?.join(", "))} · ${report.repeats} repeats · ${report.guardrail?.tasks} unscored tasks · Sampling/reasoning settings changed: ${report.semantic_or_reasoning_settings_changed ? "Yes" : "No"}</p><p class="small muted">${esc(report.limitation)}</p><h3>Setting deltas from baseline</h3>${table(
+    ["Setting", "Baseline", "Winner", "Effect"],
+    Object.entries(report.parameter_deltas || {}).map(
+      ([k, v]) =>
+        `<tr><td>${esc(k)}</td><td>${esc(JSON.stringify(v.baseline))}</td><td>${esc(JSON.stringify(v.winner))}</td><td>${esc(v.effect)}</td></tr>`,
+    ),
+  )}<h3>Objective components</h3>${table(
+    ["Candidate", "Runtime score", "Unscored guardrail", "Context", "Decision"],
+    (report.candidates || []).map(
+      (c) =>
+        `<tr><td>${c.candidate}</td><td>${available(c.components?.runtime_score)}</td><td>${available(c.components?.guardrail_score)}</td><td>${num(c.components?.tested_context, 0)}</td><td>${esc(c.error || c.components?.rejection_reason || "Eligible")}</td></tr>`,
+    ),
+  )}<details><summary>Baseline, winner and complete report</summary><pre>${esc(JSON.stringify(report, null, 2))}</pre></details></div>`;
 }
 function resultCards(r, live) {
   const active = ["running", "queued", "regrading"].includes(r.status);
@@ -275,11 +373,13 @@ async function leaderboard() {
               "Capability",
               "RAM peak",
               "Reliability",
+              "Active duration",
+              "Correct capability / min",
               "Result",
             ],
             rows.map(
               (r) =>
-                `<tr><td><input type="checkbox" aria-label="Compare ${esc(r.model_name)}" data-select="${r.run_id}" ${state.selected.has(r.run_id) ? "checked" : ""}></td><td><a href="#model/${r.model_id}"><strong>${esc(r.model_name)}</strong></a><small>${esc(r.quantisation)} · ${esc(r.profile_name)} · ${esc(qualification(r))} · workload ${r.comparability_group.slice(0, 8)}</small></td><td class="numeric">${num(median(r, "generation_tps"))}<small>tok/s</small></td><td class="numeric">${num(median(r, "prompt_tps"), 0)}<small>tok/s</small></td><td>${num(median(r, "ttft_ms"), 0)} ms</td><td>${r.summary.capability_status === "invalid" ? "Unavailable" : pct(r.summary.capability)}<small>${r.summary.capability_samples || 0} samples</small></td><td>${num(r.ram_peak_mb, 0)} MB<small>VRAM ${num(r.vram_peak_mb, 0)} MB</small></td><td>${pct(r.summary.reliability)}</td><td><a href="#run/${r.run_id}">${badge(r.status)} ↗</a></td></tr>`,
+                `<tr><td><input type="checkbox" aria-label="Compare ${esc(r.model_name)}" data-select="${r.run_id}" ${state.selected.has(r.run_id) ? "checked" : ""}></td><td><a href="#model/${r.model_id}"><strong>${esc(r.model_name)}</strong></a><small>${esc(r.quantisation)} · ${esc(r.profile_name)} · ${esc(qualification(r))} · workload ${r.comparability_group.slice(0, 8)}</small></td><td class="numeric">${num(median(r, "generation_tps"))}<small>tok/s</small></td><td class="numeric">${num(median(r, "prompt_tps"), 0)}<small>tok/s</small></td><td>${num(median(r, "ttft_ms"), 0)} ms</td><td>${r.summary.capability_status === "invalid" ? "Unavailable" : pct(r.summary.capability)}<small>${r.summary.capability_samples || 0} samples</small></td><td>${num(r.ram_peak_mb, 0)} MB<small>VRAM ${num(r.vram_peak_mb, 0)} MB</small></td><td>${pct(r.summary.reliability)}</td><td>${duration(r.timing?.active_seconds)}</td><td>${available(r.summary.efficiency?.correct_capability_samples_per_minute)}</td><td><a href="#run/${r.run_id}">${badge(r.status)} ↗</a></td></tr>`,
             ),
           )
         : empty(
@@ -392,6 +492,7 @@ async function runs() {
     ) + `<div class="panel">${runTable(state.runs)}</div>`;
 }
 async function runDetail(id) {
+  const viewHash = location.hash;
   const r = await api("/runs/" + id),
     s = r.summary || {},
     records = r.records || [],
@@ -400,6 +501,7 @@ async function runDetail(id) {
   const metrics = s.metrics || {};
   const active = ["running", "queued", "regrading"].includes(r.status);
   const monitor = active ? await api(`/runs/${id}/live`) : null;
+  if (location.hash !== viewHash) return;
   state.openRun = {
     id,
     status: r.status,
@@ -422,6 +524,8 @@ async function runDetail(id) {
       ? `<div class="notice warning">${esc(s.capability_warning)}</div>`
       : "") +
     `<div id="live-monitor">${monitor ? livePanel(monitor) : ""}</div><div id="run-cards">${resultCards(r, monitor?.live)}</div>` +
+    efficiencyPanel(r) +
+    optimisationPanel(r.optimisation_report) +
     `<div class="grid-two"><div class="panel"><h2>Generation across contexts</h2>${curves([r], "generation_tps", "Generation tok/s")}</div><div class="panel"><h2>Capability by category</h2>${
       Object.values(s.categories || {}).some((v) => v.score != null)
         ? bars(
@@ -448,7 +552,7 @@ async function runDetail(id) {
       ),
     )}</div>` +
     (r.winner
-      ? `<div class="panel"><h2>Winning configuration</h2><p>Saved ${esc(r.request.profile_name)} profile <span class="mono">${r.winner.profile_id}</span></p><pre>${esc(JSON.stringify(r.winner.config, null, 2))}</pre></div>`
+      ? `<div class="panel"><h2>Winning configuration</h2><p>Saved ${esc(r.request.profile_name)} profile · objective ${esc(r.request.optimisation_objective || r.request.profile_name)} <span class="mono">${r.winner.profile_id}</span></p><pre>${esc(JSON.stringify(r.winner.config, null, 2))}</pre></div>`
       : "") +
     (candidates.length
       ? `<div class="panel"><h2>Every optimisation candidate</h2>${table(
@@ -464,17 +568,26 @@ async function runDetail(id) {
           ],
           candidates.map(
             (c) =>
-              `<tr class="test-result" data-action="inspect" data-run="${id}" data-id="${c.id}"><td>${c.candidate}</td><td>${c.config.gpu_layers}</td><td>${c.config.threads}</td><td>${c.config.batch_size}/${c.config.ubatch_size}</td><td>${c.config.flash_attn ? "on" : "off"} / ${c.config.mmap ? "on" : "off"}</td><td>${c.config.cache_type_k}/${c.config.cache_type_v}</td><td>${num(c.objective, 3)}</td><td>${c.stable ? badge("ready") : `<span class="badge bad" title="${esc(c.error)}">failed</span>`}</td></tr>`,
+              `<tr class="test-result" data-action="inspect" data-run="${id}" data-id="${c.id}"><td>${c.candidate}</td><td>${c.config.gpu_layers}</td><td>${c.config.threads}</td><td>${c.config.batch_size}/${c.config.ubatch_size}</td><td>${c.config.flash_attn ? "on" : "off"} / ${c.config.mmap ? "on" : "off"}</td><td>${c.config.cache_type_k}/${c.config.cache_type_v}</td><td>${num(c.objective, 3)}</td><td>${c.eligible === false ? `<span class="badge warn" title="${esc(c.objective_components?.rejection_reason)}">rejected</span>` : c.stable ? badge("ready") : `<span class="badge bad" title="${esc(c.error)}">failed</span>`}</td></tr>`,
           ),
         )}</div>`
       : "") +
     `<div class="panel"><h2>Response inspector</h2><p class="small muted">Click a row to see the exact prompt, rule, raw answer, reasoning, timings and settings.</p>${
       caps.length
         ? table(
-            ["Test", "Category", "Context", "Repeat", "Score", "Result"],
+            [
+              "Test",
+              "Category",
+              "Context",
+              "Repeat",
+              "Duration",
+              "Input / output tokens",
+              "Score",
+              "Result / reason",
+            ],
             caps.map(
               (t) =>
-                `<tr class="test-result" tabindex="0" data-action="inspect" data-run="${id}" data-id="${t.id}"><td>${esc(t.test_id)}</td><td>${esc(t.category)}</td><td>${t.context_size}</td><td>${t.repeat + 1}</td><td>${t.legacy_grading_warning ? "Unvalidated" : pct(t.grade.score)}</td><td>${t.legacy_grading_warning ? '<span class="badge warn">historical</span>' : t.grade.valid === false ? '<span class="badge warn">unavailable</span>' : t.grade.passed ? '<span class="badge good">pass</span>' : `<span class="badge bad" title="${esc(t.grade.detail)}">fail</span>`}</td></tr>`,
+                `<tr class="test-result" tabindex="0" data-action="inspect" data-run="${id}" data-id="${t.id}"><td>${esc(t.test_id)}</td><td>${esc(t.category)}</td><td>${t.context_size}</td><td>${t.repeat + 1}</td><td>${available(t.diagnostics?.sample_duration_ms, " ms")}</td><td>${available(t.diagnostics?.input_tokens)} / ${available(t.diagnostics?.output_tokens)}</td><td>${t.legacy_grading_warning ? "Unvalidated" : pct(t.grade.score)}</td><td>${t.legacy_grading_warning ? '<span class="badge warn">historical</span>' : t.grade.valid === false ? '<span class="badge warn">unavailable</span>' : t.grade.passed ? '<span class="badge good">pass</span>' : `<span class="badge bad" title="${esc(t.grade.detail)}">fail</span>`}<small>${esc(t.diagnostics?.failure_reason || "")}</small></td></tr>`,
             ),
           )
         : empty(
@@ -494,7 +607,9 @@ async function runDetail(id) {
     `<div class="panel"><h2>Reproduce this run</h2><p class="small muted">Benchmark ${esc(r.benchmark.id)} · machine ${esc(r.environment?.fingerprint?.slice(0, 12))} · group ${esc(r.comparability_group?.slice(0, 12))}</p>${(r.commands || []).map((c) => `<details><summary>${esc(c.workspace)} — exact command and profile</summary><pre class="command">${esc(c.command)}</pre><pre>${esc(JSON.stringify(c.config, null, 2))}</pre></details>`).join("")}<details><summary>Full manifest</summary><pre>${esc(JSON.stringify({ ...r, records: undefined, runtime: r.runtime ? { ...r.runtime, help: "See runtime.json in artifact archive" } : undefined }, null, 2))}</pre></details></div>`;
 }
 async function compare() {
+  const viewHash = location.hash;
   await loadCore();
+  if (location.hash !== viewHash) return;
   const selected = state.runs.filter((r) => state.selected.has(r.id));
   if (selected.length < 2) {
     $("#content").innerHTML =
@@ -512,7 +627,18 @@ async function compare() {
         .slice(0, 6)
         .join(","),
   );
-  const rr = result.runs;
+  if (location.hash !== viewHash) return;
+  const rr = result.runs.sort((a, b) => {
+    const value = (r) =>
+      state.comparisonSort === "active_seconds"
+        ? r.timing?.active_seconds
+        : r.summary?.efficiency?.correct_capability_samples_per_minute;
+    const av = value(a),
+      bv = value(b);
+    if (av == null) return bv == null ? 0 : 1;
+    if (bv == null) return -1;
+    return state.comparisonSort === "active_seconds" ? av - bv : bv - av;
+  });
   $("#content").innerHTML =
     head(
       "Profile comparison",
@@ -522,6 +648,19 @@ async function compare() {
     (result.warning
       ? `<div class="notice warning">${esc(result.warning)}</div>`
       : `<div class="notice">Matching machine, runtime build, benchmark version and controlled workload.</div>`) +
+    `<div class="panel"><h2>Task efficiency</h2><label class="field">Sort comparison by<select id="comparison-sort"><option value="active_seconds" ${state.comparisonSort === "active_seconds" ? "selected" : ""}>Active duration (shortest first)</option><option value="correct" ${state.comparisonSort === "correct" ? "selected" : ""}>Correct capability samples / minute (highest first)</option></select></label>${table(
+      [
+        "Profile",
+        "Evidence",
+        "Active duration",
+        "Queue wait",
+        "Correct capability / min",
+      ],
+      rr.map(
+        (r) =>
+          `<tr><td>${esc(r.profile.name)}</td><td>${r.status === "completed" ? "Completed" : "PARTIAL / ineligible"}</td><td>${duration(r.timing?.active_seconds)}</td><td>${duration(r.timing?.queue_wait_seconds)}</td><td>${available(r.summary?.efficiency?.correct_capability_samples_per_minute)}</td></tr>`,
+      ),
+    )}</div>` +
     `<div class="cards">${rr.map((r, i) => card(`${state.models.find((m) => m.id === r.model_id)?.name || r.model_id} / ${r.profile.name}`, `<span style="color:${colors[i % colors.length]}">${num(median(r, "generation_tps"))} <small>tok/s</small></span>`, `${pct(r.summary.capability)} capability · ${pct(r.summary.reliability)} reliability`)).join("")}</div>` +
     `<div class="grid-two"><div class="panel"><h2>Generation tok/s</h2>${curves(rr, "generation_tps", "Generation tok/s")}</div><div class="panel"><h2>Prompt tok/s</h2>${curves(rr, "prompt_tps", "Prompt tok/s")}</div></div><div class="grid-two"><div class="panel"><h2>Time to first generated token (ms)</h2>${curves(rr, "ttft_ms", "TTFT ms")}</div><div class="panel"><h2>Capability categories</h2>${[
       ...new Set(rr.flatMap((r) => Object.keys(r.summary.categories || {}))),
@@ -630,7 +769,7 @@ async function runModal(modelId) {
   const profiles = state.profiles.filter((p) => p.model_id === chosen);
   modal(
     "New benchmark",
-    `<form id="run-form"><div class="form-grid"><label class="field">Model<select name="model_id" id="run-model">${ready.map((m) => `<option value="${m.id}" ${m.id === chosen ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></label><label class="field">Saved profile<select name="profile_id" id="run-profile" required>${profiles.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.config_sha256.slice(0, 7)}</option>`).join("")}</select></label></div><button type="button" class="link-button" data-action="profile" data-id="${chosen}">+ Create a profile</button><div class="hr"></div><label class="field">Qualification preset<select name="qualification" id="qualification"><option value="quick">QUICK QUALIFICATION</option><option value="full">FULL QUALIFICATION</option><option value="smoke">PIPELINE SMOKE TEST</option><option value="custom">Custom benchmark / optimisation</option></select></label><p class="small muted" id="qualification-note">Quick: performance at 2048 / 8192, standard capability suite at the saved profile context, 3 repeats, long-context matrix off. Leaderboard eligible.</p><div class="form-grid"><label class="field">Stage<select name="stage" id="run-stage"><option value="full">Performance + capability</option><option value="optimise">Automatic optimisation</option><option value="performance">Performance only</option><option value="capability">Capability only</option></select></label><label class="field">Repeats<input name="repeats" type="number" min="3" max="10" value="3" required></label></div><label class="checkbox"><input name="smoke" type="checkbox"> Pipeline smoke test (custom mode; excluded from leaderboard)</label><div class="form-grid"><label class="field">Context sizes, comma separated<input name="contexts" value="2048,4096,8192" required></label><label class="field">Performance generation tokens<input name="generation_tokens" type="number" value="128" min="16" max="1024"></label></div><label class="checkbox"><input name="long_context" type="checkbox" checked> Include long-context capability matrix (can take substantial time)</label><details><summary>Optimisation depth and profile objective</summary><div class="form-grid"><label class="field">Search preset<select name="preset"><option>quick</option><option>standard</option><option>thorough</option><option>drill</option></select></label><label class="field">Save winner as<select name="profile_name"><option>BALANCED</option><option>FAST</option><option>SMART</option></select></label><label class="field">Optional tuning contexts (comma separated)<input name="tune_contexts" placeholder="Blank = selected profile context"></label><label class="field">Load observations per context<input name="load_repeats" type="number" value="3" min="1" max="5"></label><label class="field">Candidate budget (blank = preset default)<input name="candidate_limit" type="number" min="1" max="128"></label></div><p class="small muted">Quick 8 → standard 24 → thorough 64 → drill 32 around your selected profile. Every candidate repeats at least three times. SMART uses your profile's chosen context and reasoning settings; its intelligence is assessed separately.</p></details><div class="dialog-footer"><button class="primary" ${profiles.length ? "" : "disabled"}>Queue benchmark</button></div></form>`,
+    `<form id="run-form"><div class="form-grid"><label class="field">Model<select name="model_id" id="run-model">${ready.map((m) => `<option value="${m.id}" ${m.id === chosen ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></label><label class="field">Saved profile<select name="profile_id" id="run-profile" required>${profiles.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.config_sha256.slice(0, 7)}</option>`).join("")}</select></label></div><button type="button" class="link-button" data-action="profile" data-id="${chosen}">+ Create a profile</button><div class="hr"></div><label class="field">Qualification preset<select name="qualification" id="qualification"><option value="quick">QUICK QUALIFICATION</option><option value="full">FULL QUALIFICATION</option><option value="smoke">PIPELINE SMOKE TEST</option><option value="custom">Custom benchmark / optimisation</option></select></label><p class="small muted" id="qualification-note">Quick: performance at 2048 / 8192, standard capability suite at the saved profile context, 3 repeats, long-context matrix off. Leaderboard eligible.</p><div class="form-grid"><label class="field">Stage<select name="stage" id="run-stage"><option value="full">Performance + capability</option><option value="optimise">Automatic optimisation</option><option value="performance">Performance only</option><option value="capability">Capability only</option></select></label><label class="field">Repeats<input name="repeats" type="number" min="3" max="10" value="3" required></label></div><label class="checkbox"><input name="smoke" type="checkbox"> Pipeline smoke test (custom mode; excluded from leaderboard)</label><div class="form-grid"><label class="field">Context sizes, comma separated<input name="contexts" value="2048,4096,8192" required></label><label class="field">Performance generation tokens<input name="generation_tokens" type="number" value="128" min="16" max="1024"></label></div><label class="checkbox"><input name="long_context" type="checkbox" checked> Include long-context capability matrix (can take substantial time)</label><details><summary>Optimisation settings</summary><div class="form-grid"><label class="field">Search preset<select name="preset"><option>quick</option><option>standard</option><option>thorough</option><option>drill</option></select></label><label class="field">Optimisation objective<select name="optimisation_objective"><option>BALANCED</option><option>FAST</option><option>SMART</option></select></label><label class="field">Save winner as / profile name<input name="profile_name" value="BALANCED" required maxlength="60"></label><label class="field">Optional tuning contexts (comma separated)<input name="tune_contexts" placeholder="Blank = selected profile context"></label><label class="field">Load observations per context<input name="load_repeats" type="number" value="3" min="1" max="5"></label><label class="field">Candidate budget (blank = preset default)<input name="candidate_limit" type="number" min="1" max="128"></label></div><p class="small muted">Quick 8 → standard 24 → thorough 64 → drill 32 around your selected profile. Every candidate repeats at least three times. FAST: runtime speed with stability checks. BALANCED: speed plus a small unscored capability guardrail. SMART: stronger unscored reasoning checks and bounded thinking-setting exploration. Runtime threads/batch/ubatch do not increase base model intelligence. Qualification is measured separately.</p></details><div class="dialog-footer"><button class="primary" ${profiles.length ? "" : "disabled"}>Queue benchmark</button></div></form>`,
   );
   applyQualification();
 }
@@ -672,7 +811,8 @@ async function inspector(runId, sampleId) {
   }
   modal(
     r.test_id,
-    `<p>${r.legacy_grading_warning ? '<span class="badge warn">UNVALIDATED HISTORICAL GRADE</span>' : r.grade.valid === false ? '<span class="badge warn">UNAVAILABLE</span>' : r.grade.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>'} ${r.legacy_grading_warning ? "" : pct(r.grade.score)} · ${esc(r.category)} · context ${r.context_size} · repeat ${r.repeat + 1}</p><div class="notice ${r.grade.passed ? "" : "warning"}">${esc(r.legacy_grading_warning || r.grade.detail)} ${esc(r.error || "")}</div><h3>Exact prompt</h3><pre>${esc(JSON.stringify(r.test?.messages || r.request?.messages, null, 2))}</pre><h3>Expected result / scoring rule</h3><pre>${esc(JSON.stringify(r.test?.rule, null, 2))}</pre><h3>Raw model answer</h3><pre>${esc(r.response || "(No final answer)")}</pre><h3>Final answer used for grading</h3><pre>${esc(r.final_answer ?? "(Unavailable in this historical sample)")}</pre><h3>Native tool calls</h3><pre>${esc(JSON.stringify(r.tool_calls || [], null, 2))}</pre><details><summary>Raw reasoning</summary><pre>${esc(r.reasoning || "(None returned)")}</pre></details><details><summary>Timing, grade and exact runtime configuration</summary><pre>${esc(JSON.stringify({ metrics: r.metrics, finish_reason: r.finish_reason, grade: r.grade, runtime_config: r.runtime_config, test_sha256: r.test_sha256, prompt_sha256: r.prompt_sha256, answer_extraction: r.answer_extraction, previous_grade: r.previous_grade, insertion_positions: r.test?.insertion_positions }, null, 2))}</pre></details><details><summary>Full request and stream</summary><pre>${esc(JSON.stringify({ request: r.request, events: r.events }, null, 2))}</pre></details>`,
+    sampleEvidence(r.diagnostics) +
+      `<p>${r.legacy_grading_warning ? '<span class="badge warn">UNVALIDATED HISTORICAL GRADE</span>' : r.grade.valid === false ? '<span class="badge warn">UNAVAILABLE</span>' : r.grade.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>'} ${r.legacy_grading_warning ? "" : pct(r.grade.score)} · ${esc(r.category)} · context ${r.context_size} · repeat ${r.repeat + 1}</p><div class="notice ${r.grade.passed ? "" : "warning"}">${esc(r.legacy_grading_warning || r.grade.detail)} ${esc(r.error || "")}</div><h3>Exact prompt</h3><pre>${esc(JSON.stringify(r.test?.messages || r.request?.messages, null, 2))}</pre><h3>Expected result / scoring rule</h3><pre>${esc(JSON.stringify(r.test?.rule, null, 2))}</pre><h3>Raw model answer</h3><pre>${esc(r.response || "(No final answer)")}</pre><h3>Final answer used for grading</h3><pre>${esc(r.final_answer ?? "(Unavailable in this historical sample)")}</pre><h3>Native tool calls</h3><pre>${esc(JSON.stringify(r.tool_calls || [], null, 2))}</pre><details><summary>Raw reasoning</summary><pre>${esc(r.reasoning || "(None returned)")}</pre></details><details><summary>Timing, grade and exact runtime configuration</summary><pre>${esc(JSON.stringify({ metrics: r.metrics, finish_reason: r.finish_reason, grade: r.grade, runtime_config: r.runtime_config, test_sha256: r.test_sha256, prompt_sha256: r.prompt_sha256, answer_extraction: r.answer_extraction, previous_grade: r.previous_grade, insertion_positions: r.test?.insertion_positions }, null, 2))}</pre></details><details><summary>Full request and stream</summary><pre>${esc(JSON.stringify({ request: r.request, events: r.events }, null, 2))}</pre></details>`,
   );
 }
 async function render() {
@@ -802,6 +942,10 @@ document.addEventListener("change", (event) => {
     render();
   }
   if (el.id === "qualification") applyQualification();
+  if (el.id === "comparison-sort") {
+    state.comparisonSort = el.value;
+    render();
+  }
   if (el.id === "run-model") {
     const pp = state.profiles.filter((p) => p.model_id === el.value);
     $("#run-profile").innerHTML = pp

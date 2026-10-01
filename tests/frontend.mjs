@@ -91,6 +91,10 @@ try {
     if (profiles.length)
       assert.ok(doc.querySelector("#run-profile").options.length);
     const form = doc.querySelector("#run-form");
+    assert.equal(form.elements.optimisation_objective.value, "BALANCED");
+    assert.equal(form.elements.profile_name.tagName, "INPUT");
+    form.elements.optimisation_objective.value = "FAST";
+    form.elements.profile_name.value = "Independent saved name";
     assert.equal(form.elements.qualification.value, "quick");
     assert.equal(form.elements.contexts.value, "2048,8192");
     assert.equal(form.elements.long_context.checked, false);
@@ -133,6 +137,8 @@ try {
         assert.equal(submitted.repeats, 3);
         assert.equal(submitted.long_context, false);
         assert.equal(submitted.load_repeats, 3);
+        assert.equal(submitted.optimisation_objective, "FAST");
+        assert.equal(submitted.profile_name, "Independent saved name");
         await waitFor(() => !doc.querySelector("#modal").open);
       } finally {
         window.fetch = realFetch;
@@ -203,6 +209,8 @@ try {
   }
   // Deterministic polling coverage, with no model execution or user-data writes.
   const realFetch = window.fetch;
+  let pendingComparison;
+  let deferComparison = false;
   const fixture = {
     id: "live-fixture",
     status: "running",
@@ -226,6 +234,10 @@ try {
     },
   };
   window.fetch = (url, options) => {
+    if (deferComparison && url.startsWith("/api/compare?"))
+      return new Promise((resolve) => {
+        pendingComparison = resolve;
+      });
     if (url === "/api/runs/live-fixture")
       return Promise.resolve(new Response(JSON.stringify(fixture)));
     if (url === "/api/runs/live-fixture/live")
@@ -243,13 +255,32 @@ try {
           }),
         ),
       );
+    if (url === "/api/runs/live-fixture/responses/sample-1")
+      return Promise.resolve(new Response(JSON.stringify(fixture.records[0])));
     return realFetch(url, options);
   };
   try {
+    if (measured.length === 2) {
+      deferComparison = true;
+      await go("compare");
+      await waitFor(() => pendingComparison);
+    }
     await go("run/live-fixture");
     await waitFor(
       () => doc.querySelector("#live-monitor h2")?.textContent === "LIVE RUN",
     );
+    if (pendingComparison) {
+      deferComparison = false;
+      pendingComparison(
+        new Response(JSON.stringify({ comparable: false, runs: measured })),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(
+        doc.querySelector("#live-monitor h2")?.textContent,
+        "LIVE RUN",
+        "A late comparison response cannot replace the current Run view",
+      );
+    }
     assert.match(
       doc.querySelector("#run-cards").textContent,
       /LIVE \/ PARTIAL CAPABILITYPending/,
@@ -321,6 +352,119 @@ try {
     assert.doesNotMatch(
       doc.querySelectorAll("#run-cards .card")[2].textContent,
       /0%/,
+    );
+    fixture.status = "cancelled";
+    fixture.live.status = "cancelled";
+    fixture.timing = {
+      source: "monotonic",
+      active_seconds: 70,
+      queue_wait_seconds: 30,
+      total_elapsed_seconds: 100,
+      phases: { capability: 60, performance: 5, model_load_setup: 5 },
+    };
+    fixture.summary = {
+      partial: true,
+      capability: 0,
+      tokens: {
+        input_tokens: {
+          total: 15,
+          observed_samples: 1,
+          samples: 1,
+          complete: true,
+        },
+        reasoning_tokens: {
+          total: null,
+          observed_samples: 0,
+          samples: 1,
+          complete: false,
+        },
+      },
+      capability_response_tokens: { median: 20, p95: 20, n: 1 },
+      capability_sample_duration_ms: { median: 500, p95: 500, n: 1 },
+      efficiency: { correct_capability_samples_per_minute: 0 },
+      failure_reasons: { token_budget_truncation: 1 },
+    };
+    fixture.records = [
+      {
+        id: "sample-1",
+        type: "capability",
+        test_id: "truncated",
+        category: "reasoning",
+        context_size: 1024,
+        repeat: 0,
+        response: "<raw> partial",
+        final_answer: "<raw> partial",
+        grade: { score: 0, passed: false, detail: "Token budget exhausted" },
+        diagnostics: {
+          sample_duration_ms: 500,
+          input_tokens: 15,
+          output_tokens: 20,
+          reasoning_tokens: null,
+          final_answer_tokens: null,
+          failure_reason: "token_budget_truncation",
+          finish_reason: "length",
+          truncated: true,
+        },
+      },
+    ];
+    await go("run/live-fixture");
+    await waitFor(() =>
+      doc.querySelector("#content").textContent.includes("1m 10s"),
+    );
+    assert.match(doc.querySelector("#content").textContent, /PARTIAL evidence/);
+    assert.match(doc.querySelector("#content").textContent, /ineligible/);
+    assert.match(
+      doc.querySelector("#content").textContent,
+      /token_budget_truncation/,
+    );
+    doc.querySelector('[data-action="inspect"][data-id="sample-1"]').click();
+    await waitFor(() =>
+      doc
+        .querySelector("#modal-body")
+        .textContent.includes("Input / prompt tokens"),
+    );
+    assert.match(
+      doc.querySelector("#modal-body").textContent,
+      /Reasoning tokens \(native\)Unavailable/,
+    );
+    assert.match(
+      doc.querySelector("#modal-body").textContent,
+      /Token-budget truncationYes/,
+    );
+    assert.match(doc.querySelector("#modal-body").textContent, /<raw> partial/);
+    assert.equal(doc.querySelector("#modal-body raw"), null);
+    doc.querySelector("#close-modal").click();
+    fixture.stage = "optimise";
+    fixture.optimisation_report = {
+      objective: "BALANCED",
+      partial: true,
+      winner_kind: "capability_guarded",
+      candidates_tested: 2,
+      candidates_planned: 4,
+      rejected_candidates: 1,
+      runtime_score_improvement_percent: 0,
+      selection_rule: "Retain baseline guardrail passes",
+      limitation: "Thread/batch/ubatch do not increase base model intelligence",
+      parameter_deltas: {},
+      guardrail: { tasks: 2 },
+      candidates: [
+        {
+          candidate: 2,
+          components: { rejection_reason: "capability_guardrail_regression" },
+        },
+      ],
+    };
+    await go("run/live-fixture");
+    await waitFor(() =>
+      doc.querySelector("#content").textContent.includes("Optimisation report"),
+    );
+    assert.match(
+      doc.querySelector("#content").textContent,
+      /capability_guardrail_regression/,
+    );
+    assert.match(
+      doc.querySelector("#content").textContent,
+      /do not increase base model intelligence/,
     );
   } finally {
     window.fetch = realFetch;

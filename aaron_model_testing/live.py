@@ -9,7 +9,7 @@ from .performance import distribution
 
 EVENT_LIMIT = 30
 ROLLING_SAMPLES = 12
-SAMPLE_TYPES = {"performance", "capability", "tuning_performance"}
+SAMPLE_TYPES = {"performance", "capability", "tuning_performance", "tuning_guardrail"}
 
 
 def activity(sample):

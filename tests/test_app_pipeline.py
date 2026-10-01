@@ -214,6 +214,9 @@ def test_load_failures_count_all_scheduled_samples(client):
     assert run["summary"]["attempts"] == 9
     assert run["summary"]["reliability"] == pytest.approx(2 / 3)
     assert run["summary"]["contexts"]["4096"]["generation_tps"]["median"] is None
+    assert run["summary"]["partial"] and not run["qualification_eligible"]
+    assert client.get("/api/leaderboard").json() == []
+    assert run["timing"]["active_seconds"] > 0
 
 
 def test_tuning_saves_winner_and_never_uses_scored_questions(client):
@@ -235,6 +238,7 @@ def test_tuning_saves_winner_and_never_uses_scored_questions(client):
     assert len([r for r in run["records"] if r["type"] == "candidate"]) == 2
     assert not any(r["type"] == "capability" for r in run["records"])
     assert len([r for r in run["records"] if r["type"] == "tuning_performance"]) == 6
+    assert run["live"]["completed_samples"] == run["planned_samples"] == 18
     assert client.get("/api/leaderboard").json() == []
 
 
@@ -277,7 +281,9 @@ def test_pending_job_cancellation_is_durable(client):
     assert client.post("/api/jobs/" + second["id"] + "/cancel").json()["cancellation_requested"]
     gate.set()
     assert wait_job(client, first["id"])["status"] == "completed"
-    assert wait_job(client, second["id"])["status"] == "cancelled"
+    cancelled = wait_job(client, second["id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["active_seconds"] is None and cancelled["total_elapsed_seconds"] >= 0
     manager.scan = original
 
 
@@ -362,6 +368,12 @@ def test_monitor_updates_while_request_is_still_active_and_cancels(client, monke
         final = wait_job(client, job["id"])
         assert final["status"] == "cancelled"
         assert client.get(f"/api/runs/{status['run_id']}/live").json()["live"]["status"] == "cancelled"
+        recorded = client.get(f"/api/runs/{status['run_id']}").json()
+        assert recorded["summary"]["partial"] and not recorded["qualification_eligible"]
+        assert recorded["summary"]["tokens"]["output_tokens"]["total"] == 390
+        assert recorded["timing"]["phases"]["capability"] > 0
+        assert recorded["timing"]["active_seconds"] > 0
+        assert client.get("/api/leaderboard").json() == []
     finally:
         release.set()
 
@@ -390,7 +402,9 @@ def test_quick_qualification_uses_complete_standard_suite_and_eligible_workload(
     assert run["planned_samples"] == 99
     assert run["live"]["completed_samples"] == 99
     assert len(run["live"]["events"]) == 30
-    assert client.get("/api/leaderboard").json()[0]["request"]["qualification"] == "quick"
+    # The preset is eligible only when completed; the fake 8192 context fails to load.
+    assert run["status"] == "partial" and not run["qualification_eligible"]
+    assert client.get("/api/leaderboard").json() == []
 
 
 def test_full_and_smoke_presets_keep_existing_methodology():
@@ -411,3 +425,270 @@ def test_full_and_smoke_presets_keep_existing_methodology():
         pipeline.RunRequest(
             model_id="m", profile_id="p", qualification="quick", test_ids=["instruction-label"]
         )
+
+
+def test_queued_run_duration_keeps_wait_separate_from_monotonic_active_time(client):
+    manager = client.app_instance.state.manager
+    entered, gate = threading.Event(), threading.Event()
+
+    def scan(job_id, roots, event):
+        entered.set()
+        assert gate.wait(5)
+
+    manager.scan = scan
+    first = manager.submit("scan", {"roots": []})
+    assert entered.wait(5)
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs",
+        json={
+            "model_id": "model",
+            "profile_id": profile["id"],
+            "stage": "capability",
+            "contexts": [1024],
+            "test_ids": ["instruction-label"],
+            "long_context": False,
+        },
+    ).json()
+    time.sleep(0.08)
+    gate.set()
+    wait_job(client, first["id"])
+    final = wait_job(client, job["id"])
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    timing = run["timing"]
+    assert timing["queue_wait_seconds"] >= 0.08
+    assert timing["total_elapsed_seconds"] == pytest.approx(
+        timing["queue_wait_seconds"] + timing["active_seconds"]
+    )
+    assert sum(timing["phases"].values()) == pytest.approx(timing["active_seconds"], abs=0.001)
+    assert run["started_at"] and run["queued_at"] and run["finished_at"]
+    assert run["summary"]["efficiency"]["correct_capability_samples_per_minute"] == pytest.approx(
+        180 / timing["active_seconds"]
+    )
+
+
+def test_failed_setup_retains_timing_and_is_ineligible(client, monkeypatch):
+    monkeypatch.setattr(
+        pipeline, "probe", lambda binary: (_ for _ in ()).throw(RuntimeError("broken runtime"))
+    )
+    profile = new_profile(client)
+    job = client.post("/api/runs", json={"model_id": "model", "profile_id": profile["id"]}).json()
+    final = wait_job(client, job["id"])
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    assert run["status"] == "failed" and run["timing"]["active_seconds"] > 0
+    assert not run["qualification_eligible"] and run["summary"]["partial"]
+
+
+def test_legacy_detail_derives_diagnostics_without_modifying_artifact(client):
+    from aaron_model_testing.grading import grade_result
+    from aaron_model_testing.util import file_hash, write_json
+
+    store = client.app_instance.state.store
+    folder = store.home / "artifacts" / "legacy-evidence"
+    folder.mkdir(parents=True)
+    raw = {
+        "id": "sample-old",
+        "type": "capability",
+        "success": True,
+        "response": "[]",
+        "category": "structured_output",
+        "test": {"rule": {"type": "json", "schema": {"type": "object"}}},
+        "metrics": {"input_tokens": 12, "output_tokens": 2, "latency_ms": 20},
+    }
+    raw.update(grade_result(raw, raw["test"]["rule"]))
+    (folder / "records.jsonl").write_text(json.dumps(raw) + "\n", encoding="utf-8")
+    record = {
+        "id": "legacy-evidence",
+        "status": "completed",
+        "stage": "capability",
+        "smoke": False,
+        "model": {"name": "old model"},
+        "profile": {"name": "old profile"},
+        "created_at": "2026-10-01T00:00:00+00:00",
+        "finished_at": "2026-10-01T00:01:10+00:00",
+        "benchmark": {"id": "agent-core-v1.1"},
+        "summary": {"capability": 0},
+    }
+    store.put("runs", record)
+    write_json(folder / "manifest.json", record)
+    hashes = {name: file_hash(folder / name) for name in ("manifest.json", "records.jsonl")}
+    run = client.get("/api/runs/legacy-evidence").json()
+    assert run["timing"]["active_seconds"] == 70
+    assert run["records"][0]["diagnostics"]["failure_reason"] == "schema_failure"
+    assert run["summary"]["failure_reasons"] == {"schema_failure": 1}
+    assert hashes == {name: file_hash(folder / name) for name in hashes}
+
+
+@pytest.mark.parametrize("objective,expected_candidate", [("FAST", 2), ("BALANCED", 1)])
+def test_objective_separate_from_name_and_balanced_rejects_faster_regression(
+    client, monkeypatch, objective, expected_candidate
+):
+    from aaron_model_testing.tuning_guardrails import BALANCED_TASKS
+
+    original = FakeServer.request
+
+    def request(self, payload, chat=True):
+        result = original(self, payload, chat)
+        if not self.config.flash_attn:
+            result["metrics"]["generation_tps"] = 100
+        if chat:
+            content = payload["messages"][0]["content"]
+            task = next((t for t in BALANCED_TASKS if t["prompt"] == content), None)
+            if task:
+                expected = task["rule"]["expected"]
+                result["response"] = expected if isinstance(expected, str) else json.dumps(expected)
+                if not self.config.flash_attn and task["id"] == "tune-parse":
+                    result["response"] = "bad"
+        return result
+
+    monkeypatch.setattr(FakeServer, "request", request)
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs",
+        json={
+            "model_id": "model",
+            "profile_id": profile["id"],
+            "stage": "optimise",
+            "candidate_limit": 2,
+            "optimisation_objective": objective,
+            "profile_name": "My tuned profile",
+        },
+    ).json()
+    final = wait_job(client, job["id"])
+    assert final["status"] == "completed", final
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    assert run["winner"]["candidate"] == expected_candidate
+    assert run["optimisation_objective"] == objective and run["save_winner_as"] == "My tuned profile"
+    saved = next(p for p in client.get("/api/profiles").json() if p["id"] == run["winner"]["profile_id"])
+    assert saved["name"] == "My tuned profile" and saved["optimisation_objective"] == objective
+    report = run["optimisation_report"]
+    assert not report["partial"] and report["candidates_tested"] == 2
+    assert report["baseline"]["config"] == profile["config"]
+    if objective == "BALANCED":
+        assert report["candidates"][1]["components"]["rejection_reason"] == "capability_guardrail_regression"
+        assert report["runtime_score_improvement_percent"] == 0
+    else:
+        assert report["runtime_score_improvement_percent"] == 100
+        assert report["parameter_deltas"]["flash_attn"]["winner"] is False
+        assert not any(r["type"] == "tuning_guardrail" for r in run["records"])
+
+
+def test_smart_measures_stronger_reasoning_checks_and_explores_thinking(client, monkeypatch):
+    from aaron_model_testing.tuning_guardrails import SMART_TASKS
+
+    original = FakeServer.request
+
+    def request(self, payload, chat=True):
+        result = original(self, payload, chat)
+        if chat:
+            task = next((t for t in SMART_TASKS if t["prompt"] == payload["messages"][0]["content"]), None)
+            if task and (task["id"] != "tune-reason" or self.config.sampling.enable_thinking):
+                expected = task["rule"]["expected"]
+                result["response"] = expected if isinstance(expected, str) else json.dumps(expected)
+        return result
+
+    monkeypatch.setattr(FakeServer, "request", request)
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs",
+        json={
+            "model_id": "model",
+            "profile_id": profile["id"],
+            "stage": "optimise",
+            "candidate_limit": 2,
+            "optimisation_objective": "SMART",
+            "profile_name": "Reasoning candidate",
+        },
+    ).json()
+    final = wait_job(client, job["id"])
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    assert run["winner"]["candidate"] == 2
+    assert run["winner"]["config"]["sampling"]["enable_thinking"]
+    assert run["optimisation_report"]["semantic_or_reasoning_settings_changed"]
+    assert run["optimisation_report"]["guardrail"]["tasks"] == 4
+    assert run["summary"]["capability_samples"] == 0
+
+
+def test_tuning_refuses_scored_prompt_leakage_before_launch(client, monkeypatch):
+    from aaron_model_testing import tuning_guardrails
+
+    suite = client.get("/api/tests").json()["suite"]
+    monkeypatch.setattr(
+        tuning_guardrails, "SMART_TASKS", [{"id": "different-id", "prompt": suite["tests"][0]["prompt"]}]
+    )
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs", json={"model_id": "model", "profile_id": profile["id"], "stage": "optimise"}
+    ).json()
+    final = wait_job(client, job["id"])
+    assert final["status"] == "failed" and "overlaps scored" in final["error"]
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    assert run["commands"] == []
+
+
+def test_cancelled_optimisation_preserves_partial_candidate_report_without_saved_winner(client, monkeypatch):
+    original = FakeServer.request
+    entered = threading.Event()
+
+    def request(self, payload, chat=True):
+        if chat and payload["messages"][0]["content"].startswith("For this unscored"):
+            entered.set()
+            while not self.cancel.wait(0.01):
+                pass
+            return {
+                "success": False,
+                "response": "partial",
+                "metrics": {"input_tokens": 10},
+                "error": "cancelled",
+                "error_kind": "cancelled",
+            }
+        return original(self, payload, chat)
+
+    monkeypatch.setattr(FakeServer, "request", request)
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs",
+        json={"model_id": "model", "profile_id": profile["id"], "stage": "optimise", "candidate_limit": 2},
+    ).json()
+    assert entered.wait(5)
+    assert client.post("/api/jobs/" + job["id"] + "/cancel").json()["cancellation_requested"]
+    final = wait_job(client, job["id"])
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    assert run["status"] == "cancelled" and run["summary"]["partial"]
+    assert run["optimisation_report"]["partial"] and run["optimisation_report"]["candidates_tested"] == 1
+    assert not run.get("winner")
+    assert len(client.get("/api/profiles").json()) == 1
+    assert run["summary"]["tokens"]["output_tokens"]["total"] == 384
+
+
+def test_compare_timing_and_partial_exclusion_even_in_same_comparison_group(client):
+    profile = new_profile(client)
+    ids = []
+    for _ in range(2):
+        job = client.post(
+            "/api/runs",
+            json={
+                "model_id": "model",
+                "profile_id": profile["id"],
+                "stage": "capability",
+                "contexts": [1024],
+                "test_ids": ["instruction-label"],
+                "long_context": False,
+            },
+        ).json()
+        ids.append(wait_job(client, job["id"])["run_id"])
+    result = client.get("/api/compare", params={"ids": ",".join(ids)}).json()
+    assert result["comparable"] and result["warning"] is None
+    assert all(
+        r["timing"]["active_seconds"] > 0
+        and r["summary"]["efficiency"]["correct_capability_samples_per_minute"] > 0
+        for r in result["runs"]
+    )
+    store = client.app_instance.state.store
+    partial = store.get("runs", ids[1])
+    partial["status"] = "cancelled"
+    store.put("runs", partial)
+    result = client.get("/api/compare", params={"ids": ",".join(ids)}).json()
+    assert not result["comparable"] and "diagnostic" in result["warning"]
+    assert result["runs"][1]["summary"]["partial"]
+    assert {r["run_id"] for r in client.get("/api/leaderboard").json()} == {ids[0]}

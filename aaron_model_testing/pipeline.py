@@ -4,14 +4,16 @@ import json
 import queue
 import shutil
 import threading
+import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .aggregation import aggregate
 from .config import Settings
+from .evidence import EVIDENCE_VERSION, diagnose, summarize_evidence
 from .grading import GRADER_VERSION, grade_result
 from .inventory import discover, register, verify_model
 from .live import EVENT_LIMIT, activity, snapshot
@@ -20,7 +22,8 @@ from .performance import summarize, workload
 from .profiles import RuntimeConfig
 from .runtime import NativeServer, allocations, environment, probe
 from .suite import ROOT, load_suite
-from .tuning import candidates, objective
+from .tuning import OPTIMISER_VERSION, candidates, config_deltas, objective_components, selection_key
+from .tuning_guardrails import GUARDRAIL_VERSION, tasks_for, verify_separation
 from .util import digest, distribution_notices, file_hash, now, write_json
 
 
@@ -40,11 +43,18 @@ class RunRequest(BaseModel):
     preset: Literal["quick", "standard", "thorough", "drill"] = "quick"
     candidate_limit: int | None = Field(default=None, ge=1, le=128)
     tune_contexts: list[int] | None = Field(default=None, min_length=1, max_length=6)
-    profile_name: Literal["FAST", "BALANCED", "SMART"] = "BALANCED"
+    profile_name: str = Field(default="BALANCED", min_length=1, max_length=60)
+    optimisation_objective: Literal["FAST", "BALANCED", "SMART"] | None = None
     load_repeats: int = Field(default=3, ge=1, le=5)
 
     @model_validator(mode="after")
     def valid(self):
+        # Old clients used the profile name as the objective. Explicit new objectives
+        # always win; arbitrary saved names default to BALANCED.
+        if self.optimisation_objective is None:
+            self.optimisation_objective = (
+                self.profile_name if self.profile_name in ("FAST", "BALANCED", "SMART") else "BALANCED"
+            )
         if self.qualification != "custom":
             if self.stage != "full" or self.test_ids is not None:
                 raise ValueError(
@@ -77,17 +87,63 @@ class ArtifactRun:
         self.path = store.home / "artifacts" / record["id"]
         self.path.mkdir(parents=True, exist_ok=False)
         self.records = []
+        offset = record.pop("active_offset_seconds", 0)
+        self.started_clock = time.perf_counter() - offset
+        self.phase_clock = self.started_clock
+        self.phase_key = "other"
+        self.phases = {}
+        self.terminal_clock = None
         self.file = (self.path / "records.jsonl").open("a", encoding="utf-8", newline="\n")
         self.save()
 
     def save(self):
+        self.capture_timing()
         write_json(self.path / "manifest.json", self.record)
         self.store.put("runs", self.record)
 
     def summary(self):
-        return aggregate(self.records)
+        self.capture_timing()
+        return summarize_evidence(self.records, self.record)
+
+    def capture_timing(self):
+        if self.record.get("regrade"):
+            return
+        clock = self.terminal_clock or time.perf_counter()
+        self.phases[self.phase_key] = self.phases.get(self.phase_key, 0) + max(0, clock - self.phase_clock)
+        self.phase_clock = clock
+        active = max(0, clock - self.started_clock)
+        queue_wait = self.record.get("queue_wait_seconds")
+        self.record["timing"] = {
+            "version": EVIDENCE_VERSION,
+            "source": "monotonic",
+            "active_seconds": active,
+            "queue_wait_seconds": queue_wait,
+            "total_elapsed_seconds": active + queue_wait if queue_wait is not None else None,
+            "phases": dict(self.phases),
+        }
+
+    @contextmanager
+    def measure(self, key):
+        self.capture_timing()
+        previous, self.phase_key = self.phase_key, key
+        try:
+            yield
+        finally:
+            self.capture_timing()
+            self.phase_key = previous
 
     def phase(self, phase, **values):
+        self.capture_timing()
+        self.phase_key = {
+            "Loading": "model_load_setup",
+            "Warmup": "model_load_setup",
+            "Performance": "performance",
+            "Capability": "capability",
+            "Optimisation": "performance",
+            "Tuning guardrail": "capability",
+            "Building long-context case": "capability",
+            "Cleanup": "cleanup",
+        }.get(phase, "other")
         live = self.record.setdefault("live", {"events": []})
         live.update({"phase": phase, "current_test": None, "current_repeat": None, **values})
         self.save()
@@ -96,12 +152,15 @@ class ArtifactRun:
         import os
 
         result = {"id": f"sample-{len(self.records) + 1:05d}", "timestamp": now(), **result}
+        if result.get("type") in ("capability", "performance", "tuning_performance", "tuning_guardrail"):
+            result["diagnostics"] = diagnose(result)
         self.records.append(result)
         self.file.write(json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n")
         self.file.flush()
         os.fsync(self.file.fileno())
         self.record["sample_count"] = len(self.records)
-        self.record["summary"] = self.summary()
+        with self.measure("grading_aggregation"):
+            self.record["summary"] = self.summary()
         live = self.record.setdefault("live", {"events": []})
         event = activity(result)
         if event:
@@ -113,6 +172,7 @@ class ArtifactRun:
         self.record.update(status=status, error=error, finished_at=now())
         self.record["live"] = snapshot(self.record, self.records)
         self.record["live"]["phase"] = status
+        self.terminal_clock = time.perf_counter()
         self.record["summary"] = self.summary()
         write_json(self.path / "summary.json", self.record["summary"])
         self.save()
@@ -134,6 +194,8 @@ class JobManager:
         self.queue = queue.Queue()
         self.lock = threading.RLock()
         self.events = {}
+        self.queued_clocks = {}
+        self.started_clocks = {}
         self.active = None
         self.closing = False
         # Recover an interrupted app, without attaching to/killing any existing process.
@@ -162,6 +224,7 @@ class JobManager:
                 "progress": "Queued for the single worker",
             }
             self.events[job["id"]] = threading.Event()
+            self.queued_clocks[job["id"]] = time.perf_counter()
             self.store.put("jobs", job)
             self.queue.put(job["id"])
             return job
@@ -235,7 +298,13 @@ class JobManager:
             try:
                 if event.is_set():
                     raise InterruptedError("Cancelled while queued")
-                self.update(job_id, status="running", started_at=now())
+                self.started_clocks[job_id] = time.perf_counter()
+                self.update(
+                    job_id,
+                    status="running",
+                    started_at=now(),
+                    queue_wait_seconds=max(0, self.started_clocks[job_id] - self.queued_clocks[job_id]),
+                )
                 job = self.store.get("jobs", job_id)
                 if job["kind"] == "scan":
                     self.scan(job_id, job["payload"]["roots"], event)
@@ -255,8 +324,18 @@ class JobManager:
                     traceback=traceback.format_exc(),
                 )
             finally:
+                clock = time.perf_counter()
+                self.update(
+                    job_id,
+                    total_elapsed_seconds=max(0, clock - self.queued_clocks[job_id]),
+                    active_seconds=max(0, clock - self.started_clocks[job_id])
+                    if job_id in self.started_clocks
+                    else None,
+                )
                 with self.lock:
                     self.events.pop(job_id, None)
+                    self.queued_clocks.pop(job_id, None)
+                    self.started_clocks.pop(job_id, None)
                     self.active = None
                 self.queue.task_done()
 
@@ -316,10 +395,17 @@ class JobManager:
         ):
             raise ValueError("Unknown or empty test selection")
         run_id = uuid.uuid4().hex
+        job = self.store.get("jobs", job_id)
         record = {
             "id": run_id,
             "job_id": job_id,
             "created_at": now(),
+            "queued_at": job["created_at"],
+            "started_at": job["started_at"],
+            "queue_wait_seconds": job.get("queue_wait_seconds"),
+            "active_offset_seconds": time.perf_counter() - self.started_clocks[job_id],
+            "evidence_version": EVIDENCE_VERSION,
+            "optimiser_version": OPTIMISER_VERSION if request.stage == "optimise" else None,
             "status": "running",
             "stage": request.stage,
             "smoke": request.smoke,
@@ -396,6 +482,7 @@ class JobManager:
                 shutil.copyfile(source, target)
             artifact.save()
             if request.stage == "optimise":
+                verify_separation(suite)
                 self.optimise(job_id, request, model, base, build, artifact, cancel)
             else:
                 self.benchmark(job_id, request, model, base, build, artifact, suite, cancel)
@@ -433,6 +520,7 @@ class JobManager:
             raise
 
     def release(self, job_id, server, artifact, name):
+        artifact.phase("Cleanup")
         server.close()
         log = server.owned.tail() if server.owned else ""
         resources = {**(server.resources or {}), "vulkan_buffer_allocated_mb": allocations(log)}
@@ -463,20 +551,39 @@ class JobManager:
             limit,
             int(model["metadata"].get(f"{model['architecture']}.block_count", 32)),
         )
-        write_json(artifact.path / "candidate-plan.json", [c.model_dump() for c in options])
         if request.tune_contexts:
-            expanded = []
+            expanded = [base]
             for candidate in options:
                 for context in request.tune_contexts:
                     expanded.append(
                         RuntimeConfig.model_validate({**candidate.model_dump(), "ctx_size": context})
                     )
-            options = expanded[:limit]
-            write_json(artifact.path / "candidate-plan.json", [c.model_dump() for c in options])
+            unique = {c.model_dump_json(): c for c in expanded}
+            options = list(unique.values())[:limit]
+        elif request.optimisation_objective == "SMART" and limit > 1:
+            # The template may ignore this generic switch; the report records measured
+            # behaviour and never claims universal support or increased intelligence.
+            thought = base.model_dump()
+            thought["sampling"] = {
+                **thought["sampling"],
+                "enable_thinking": not bool(base.sampling.enable_thinking),
+                "token_budget": min(16384, max(1024, base.sampling.token_budget * 2)),
+            }
+            options = [base, RuntimeConfig.model_validate(thought), *options[1:]][:limit]
+        write_json(artifact.path / "candidate-plan.json", [c.model_dump() for c in options])
+        objective_name = request.optimisation_objective
+        tasks = tasks_for(objective_name)
         best = None
-        best_value = None
         best_key = None
-        artifact.record["planned_samples"] = len(options) * request.repeats
+        baseline = None
+        results = []
+        artifact.record["optimisation_objective"] = objective_name
+        artifact.record["save_winner_as"] = request.profile_name
+        artifact.record["planned_samples"] = len(options) * request.repeats * (1 + len(tasks))
+        write_json(
+            artifact.path / "tuning-guardrails.json",
+            {"version": GUARDRAIL_VERSION, "tasks": tasks, "unscored": True},
+        )
         artifact.save()
         for i, config in enumerate(options):
             if cancel.is_set():
@@ -487,10 +594,12 @@ class JobManager:
                 progress=f"{request.preset}: candidate {i + 1}/{len(options)}; {request.repeats} repeats",
             )
             server, samples, error = None, [], None
+            guard_samples, interrupted = [], False
             try:
                 if model.get("context_capability") and config.ctx_size > model["context_capability"]:
                     raise ValueError("Requested context exceeds model's declared context capability")
                 server = self.launch(job_id, model, config, build, artifact, name, cancel)
+                artifact.phase("Warmup")
                 warmup = server.request(
                     {"prompt": "Warmup workload.", "n_predict": 8, "ignore_eos": True}, chat=False
                 )
@@ -517,15 +626,68 @@ class JobManager:
                 write_json(artifact.path / name / "chat-health.json", health)
                 if not health["success"]:
                     raise ValueError("Templated chat stability check failed")
-            except InterruptedError:
-                raise
+                for task in tasks:
+                    for rep in range(request.repeats):
+                        artifact.phase(
+                            "Tuning guardrail",
+                            current_context=config.ctx_size,
+                            current_test=task["id"],
+                            current_repeat=rep + 1,
+                        )
+                        start = time.perf_counter()
+                        check = server.request(
+                            {
+                                "messages": [{"role": "user", "content": task["prompt"]}],
+                                "max_tokens": min(config.sampling.token_budget, config.ctx_size // 4),
+                            }
+                        )
+                        with artifact.measure("grading_aggregation"):
+                            check.update(grade_result(check, task["rule"]))
+                        check.update(
+                            type="tuning_guardrail",
+                            candidate=i + 1,
+                            test_id=task["id"],
+                            test=task,
+                            repeat=rep,
+                            context_size=config.ctx_size,
+                            unscored=True,
+                            guardrail_version=GUARDRAIL_VERSION,
+                            sample_duration_ms=(time.perf_counter() - start) * 1000,
+                        )
+                        artifact.append(check)
+                        guard_samples.append(check)
+                        server.check()
+            except InterruptedError as exc:
+                interrupted, error = True, str(exc)
             except Exception as exc:
                 error = str(exc)
             finally:
                 if server:
                     self.release(job_id, server, artifact, name)
             summary = summarize(samples)
-            value = objective(summary, request.profile_name) if not error else None
+            passed_checks = [
+                f"{s['test_id']}:{s['repeat']}"
+                for s in guard_samples
+                if s["success"] and s["grade"].get("passed") is True
+            ]
+            guardrail = {
+                "score": len(passed_checks) / len(guard_samples) if guard_samples else None,
+                "passed_checks": passed_checks,
+                "samples": len(guard_samples),
+                "complete": len(guard_samples) == len(tasks) * request.repeats
+                and all(s["success"] and s["grade"].get("valid", True) for s in guard_samples),
+            }
+            if i == 0:
+                baseline_guardrail = guardrail
+            components = objective_components(
+                summary, objective_name, guardrail, baseline_guardrail, config.ctx_size
+            )
+            if error:
+                components.update(
+                    eligible=False,
+                    rejection_reason="cancelled" if interrupted or cancel.is_set() else "candidate_error",
+                )
+            value = components["runtime_score"]
             result = {
                 "type": "candidate",
                 "candidate": i + 1,
@@ -533,15 +695,24 @@ class JobManager:
                 "config_sha256": digest(config.model_dump()),
                 "summary": summary,
                 "objective": value,
-                "stable": value is not None,
+                "objective_components": components,
+                "guardrail": guardrail,
+                "stable": value is not None and error is None,
+                "eligible": components["eligible"],
                 "error": error,
             }
             artifact.append(result)
             write_json(artifact.path / name / "candidate.json", result)
-            key = (config.ctx_size if request.profile_name == "SMART" else 0, value or 0)
-            if value is not None and (best_key is None or key > best_key):
-                best, best_value = result, value
+            results.append(result)
+            if i == 0:
+                baseline = result
+            key = selection_key(components)
+            if key is not None and (best_key is None or key > best_key):
+                best = result
                 best_key = key
+            self.optimisation_report(artifact, request, baseline, results, best, partial=True)
+            if interrupted or cancel.is_set():
+                raise InterruptedError("Optimisation cancelled")
         if best is None:
             raise ValueError(
                 "No stable candidate passed all repeated workloads and chat health check; inspect candidate errors"
@@ -551,13 +722,74 @@ class JobManager:
             request.profile_name,
             best["config"],
             optimisation_run_id=artifact.record["id"],
-            objective=best_value,
-            notes="Best tested stable configuration at this context. Capability remains to be measured.",
+            objective=best["objective"],
+            optimisation_objective=objective_name,
+            optimiser_version=OPTIMISER_VERSION,
+            notes="Best tested stable configuration under the recorded optimisation objective. Qualification capability remains to be measured; runtime tuning does not increase base model intelligence.",
         )
         artifact.record["winner"] = {"profile_id": profile["id"], **best}
         write_json(artifact.path / "winner.json", artifact.record["winner"])
+        self.optimisation_report(artifact, request, baseline, results, best, partial=False)
         artifact.save()
         self.update(job_id, result={"winning_profile_id": profile["id"]})
+
+    def optimisation_report(self, artifact, request, baseline, results, best, partial):
+        deltas = config_deltas(baseline["config"], best["config"]) if best else {}
+        base_score = baseline.get("objective")
+        winner_score = best.get("objective") if best else None
+        report = {
+            "version": OPTIMISER_VERSION,
+            "objective": request.optimisation_objective,
+            "save_winner_as": request.profile_name,
+            "partial": partial,
+            "baseline": baseline,
+            "winner": best,
+            "candidates_tested": len(results),
+            "candidates_planned": len(
+                json.loads((artifact.path / "candidate-plan.json").read_text(encoding="utf-8"))
+            ),
+            "candidates": [
+                {
+                    "candidate": r["candidate"],
+                    "stable": r["stable"],
+                    "eligible": r["eligible"],
+                    "error": r["error"],
+                    "components": r["objective_components"],
+                }
+                for r in results
+            ],
+            "rejected_candidates": sum(not r["eligible"] for r in results),
+            "parameter_deltas": deltas,
+            "runtime_score_improvement_percent": (winner_score / base_score - 1) * 100
+            if winner_score is not None and base_score
+            else None,
+            "runtime_score_unit": "native_decode_tokens_per_second"
+            if request.optimisation_objective == "FAST"
+            else "fixed_workloads_per_second_256_input_128_output",
+            "contexts_tested": sorted({r["config"]["ctx_size"] for r in results}),
+            "repeats": request.repeats,
+            "guardrail": {
+                "version": GUARDRAIL_VERSION,
+                "unscored": True,
+                "tasks": len(tasks_for(request.optimisation_objective)),
+                "policy": "Retain every baseline pass at matching task/repeat; no regression tolerance",
+            },
+            "semantic_or_reasoning_settings_changed": any(
+                k in deltas for k in ("sampling", "template", "options")
+            ),
+            "winner_kind": "runtime_only"
+            if request.optimisation_objective == "FAST"
+            else "capability_guarded",
+            "selection_rule": "Stable native decode rate"
+            if request.optimisation_objective == "FAST"
+            else "Fastest fixed workload while retaining baseline guardrail passes"
+            if request.optimisation_objective == "BALANCED"
+            else "Highest unscored guardrail pass rate, then largest tested stable context, then fixed-workload speed; retain baseline passes",
+            "limitation": "A small unscored guardrail is not a qualification score. Thread/batch/ubatch changes tune execution and do not increase base model intelligence. Generic thinking support is template dependent; qualification must be measured separately.",
+        }
+        artifact.record["optimisation_report"] = report
+        write_json(artifact.path / "optimisation-report.json", report)
+        artifact.save()
 
     def benchmark(self, job_id, request, model, base, build, artifact, suite, cancel):
         tests = [
@@ -604,6 +836,7 @@ class JobManager:
                     loader = self.launch(job_id, model, config, build, artifact, load_name, cancel)
                     self.release(job_id, loader, artifact, load_name)
                 server = self.launch(job_id, model, config, build, artifact, name, cancel)
+                artifact.phase("Warmup")
                 warmup = server.request(
                     {"prompt": "Warmup workload.", "n_predict": 8, "ignore_eos": True}, chat=False
                 )
@@ -685,6 +918,7 @@ class JobManager:
                                     "repeat": rep,
                                     "context_size": context,
                                     "success": False,
+                                    "executed": False,
                                     "error": str(exc),
                                     "grade": {
                                         "score": 0,
@@ -705,6 +939,7 @@ class JobManager:
                                 "context_size": context,
                                 "repeat": rep,
                                 "success": False,
+                                "executed": False,
                                 "error": str(exc),
                             }
                         )
@@ -723,8 +958,23 @@ class JobManager:
         payload = {"messages": case["messages"], "max_tokens": budget}
         if case.get("tools"):
             payload["tools"] = case["tools"]
+        started = time.perf_counter()
+        input_tokens = None
+        # Count the exact rendered template before inference, so a killed stream can
+        # still retain prompt usage. Missing template/tokenizer support stays unavailable.
+        try:
+            input_tokens = len(server.tokenize(server.render(case["messages"], case.get("tools"))))
+        except InterruptedError:
+            raise
+        except Exception:
+            pass
         result = server.request(payload)
-        result.update(grade_result(result, case["rule"]))
+        if result.get("metrics", {}).get("input_tokens") is None and input_tokens is not None:
+            result.setdefault("metrics", {})["input_tokens"] = input_tokens
+            result["input_token_source"] = "native_template_tokenizer"
+        with artifact.measure("grading_aggregation"):
+            result.update(grade_result(result, case["rule"]))
+        result["sample_duration_ms"] = (time.perf_counter() - started) * 1000
         result.update(
             {
                 "type": "capability",

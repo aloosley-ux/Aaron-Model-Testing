@@ -103,6 +103,95 @@ def test_failed_stream_keeps_partial_answer(tmp_path):
     server.close()
 
 
+def test_malformed_native_stream_retains_previous_response_and_reports_harness_error(tmp_path):
+    server = NativeServer(
+        Settings(),
+        {"path": "a.gguf"},
+        RuntimeConfig(),
+        {"path": "unused", "help": "--load-mode"},
+        tmp_path,
+        threading.Event(),
+    )
+    server.client.close()
+    data = 'data: {"choices":[{"delta":{"content":"raw prefix"}}]}\n\ndata: bad-json\n\n'
+    server.client = httpx.Client(
+        base_url="http://127.0.0.1:1235",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=data)),
+    )
+    try:
+        result = server.request({})
+        assert result["response"] == "raw prefix" and not result["success"]
+        assert result["error_kind"] == "parser_or_harness_error"
+        assert result["metrics"]["output_tokens"] is None
+    finally:
+        server.close()
+
+
+def test_missing_native_stop_reason_stays_unavailable_without_changing_success_contract(tmp_path):
+    server = NativeServer(
+        Settings(),
+        {"path": "a.gguf"},
+        RuntimeConfig(),
+        {"path": "unused", "help": "--load-mode"},
+        tmp_path,
+        threading.Event(),
+    )
+    server.client.close()
+    data = 'data: {"choices":[{"delta":{"content":"READY"}}],"usage":{"prompt_tokens":9,"completion_tokens":2}}\n\ndata: [DONE]\n\n'
+    server.client = httpx.Client(
+        base_url="http://127.0.0.1:1235",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=data)),
+    )
+    try:
+        result = server.request({})
+        assert result["success"] and result["finish_reason"] is None
+        from aaron_model_testing.evidence import diagnose
+
+        assert diagnose(result)["truncated"] is None
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize(
+    "failure,error_kind",
+    [
+        (TimeoutError("deadline"), "timeout"),
+        (InterruptedError("cancelled"), "cancelled"),
+        (ValueError("OOM"), "inference_error"),
+    ],
+)
+def test_failed_stream_retains_native_counters_and_timing(tmp_path, failure, error_kind):
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            yield b'data: {"usage":{"prompt_tokens":9,"completion_tokens":4,"completion_tokens_details":{"reasoning_tokens":0,"final_answer_tokens":4}},"timings":{"prompt_ms":2,"predicted_ms":6}}\n\n'
+            raise failure
+
+    server = NativeServer(
+        Settings(),
+        {"path": "a.gguf"},
+        RuntimeConfig(),
+        {"path": "unused", "help": "--load-mode"},
+        tmp_path,
+        threading.Event(),
+    )
+    server.client.close()
+    server.client = httpx.Client(
+        base_url="http://127.0.0.1:1235",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=BrokenStream())),
+    )
+    try:
+        result = server.request({})
+        assert not result["success"] and result["error_kind"] == error_kind
+        assert result["response"] == "partial" and len(result["events"]) == 2
+        assert result["metrics"]["input_tokens"] == 9 and result["metrics"]["output_tokens"] == 4
+        assert result["metrics"]["reasoning_tokens"] == 0 and result["metrics"]["final_answer_tokens"] == 4
+        assert result["metrics"]["inference_duration_ms"] == 8
+        assert result["metrics"]["latency_ms"] >= result["metrics"]["ttft_ms"]
+    finally:
+        server.close()
+
+
 def test_reasoning_alias_embedded_content_and_streamed_native_tools(tmp_path):
     from aaron_model_testing.grading import grade_result
 

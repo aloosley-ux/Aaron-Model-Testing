@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from .profiles import RuntimeConfig
+from .tuning_guardrails import GUARDRAIL_VERSION
 from .vendor.tune_candidates import Candidate, build_candidates, drill_candidates
 
 
@@ -68,3 +69,68 @@ def objective(summary: dict, name: str):
         return None
     # FAST favours decoding. BALANCED/SMART favour fixed-workload time with different context goals supplied by user.
     return gen if name == "FAST" else 1 / (256 / prompt + 128 / gen)
+
+
+OPTIMISER_VERSION = "capability-guarded-tuning-v1"
+
+
+def objective_components(summary, name, guardrail, baseline, context):
+    runtime = objective(summary, name)
+    coverage = guardrail.get("complete", False)
+    baseline_available = baseline.get("complete", False)
+    score = guardrail.get("score")
+    baseline_score = baseline.get("score")
+    # No aggregate-score tolerance hides a lost task: every baseline pass must
+    # still pass the same deterministic repeat under BALANCED and SMART.
+    regressions = sorted(set(baseline.get("passed_checks", [])) - set(guardrail.get("passed_checks", [])))
+    eligible = runtime is not None and (name == "FAST" or coverage and baseline_available and not regressions)
+    return {
+        "version": OPTIMISER_VERSION,
+        "objective": name,
+        "runtime_score": runtime,
+        "guardrail_version": GUARDRAIL_VERSION if name != "FAST" else None,
+        "guardrail_score": score,
+        "baseline_guardrail_score": baseline_score,
+        "guardrail_complete": coverage if name != "FAST" else None,
+        "regressed_checks": regressions,
+        "tested_context": context,
+        "eligible": eligible,
+        "rejection_reason": "unstable_or_missing_performance"
+        if runtime is None
+        else "baseline_guardrail_unavailable"
+        if name != "FAST" and not baseline_available
+        else "incomplete_guardrail"
+        if name != "FAST" and not coverage
+        else "capability_guardrail_regression"
+        if regressions and name != "FAST"
+        else None,
+    }
+
+
+def selection_key(components):
+    if not components["eligible"]:
+        return None
+    runtime = components["runtime_score"]
+    if components["objective"] == "SMART":
+        return (components["guardrail_score"], components["tested_context"], runtime)
+    return (runtime,)
+
+
+def config_deltas(baseline, winner):
+    effects = {
+        "ctx_size": "context handling",
+        "sampling": "sampling/reasoning behaviour",
+        "template": "sampling/reasoning behaviour",
+        "options": "model-specific runtime/context/reasoning behaviour",
+        "cache_type_k": "resource use; numerical precision can affect answers",
+        "cache_type_v": "resource use; numerical precision can affect answers",
+    }
+    return {
+        key: {
+            "baseline": baseline.get(key),
+            "winner": value,
+            "effect": effects.get(key, "runtime speed/resource use"),
+        }
+        for key, value in winner.items()
+        if baseline.get(key) != value
+    }
