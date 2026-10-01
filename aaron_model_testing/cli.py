@@ -9,7 +9,9 @@ from .store import Store
 
 def main():
     parser = argparse.ArgumentParser(description="Aaron Model Testing — local Windows Vulkan benchmarks")
-    parser.add_argument("command", choices=["serve", "reindex", "verify"], nargs="?", default="serve")
+    parser.add_argument(
+        "command", choices=["serve", "reindex", "verify", "regrade"], nargs="?", default="serve"
+    )
     parser.add_argument("path", nargs="?")
     args = parser.parse_args()
     if args.command == "serve":
@@ -27,6 +29,27 @@ def main():
             print(json.dumps(Store(data_home()).reindex(), indent=2))
         finally:
             lock.close()
+    elif args.command == "regrade":
+        from .regrade import regrade
+
+        if not args.path:
+            parser.error("regrade requires a source run ID")
+        result = regrade(Store(data_home()), args.path)
+        print(
+            json.dumps(
+                {
+                    "id": result["id"],
+                    "source_run_id": args.path,
+                    "grader_version": result["grader_version"],
+                    "capability": result["summary"]["capability"],
+                    "capability_samples": result["summary"]["capability_samples"],
+                    "reliability": result["summary"]["reliability"],
+                    "errors": result["summary"]["errors"],
+                    "changed_grades": result["regrade"]["changed_grades"],
+                },
+                indent=2,
+            )
+        )
     else:
         from pathlib import Path
 

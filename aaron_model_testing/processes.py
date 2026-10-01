@@ -251,3 +251,24 @@ class Telemetry:
             "samples": self.samples,
             "gpu_samples": self.gpu_samples,
         }
+
+    def snapshot(self):
+        import time
+        from datetime import datetime, timezone
+
+        cpu = self.samples[-1] if self.samples else None
+        gpu = self.gpu_samples[-1] if self.gpu_samples else None
+        if cpu and time.monotonic() - cpu["elapsed_monotonic"] > 3:
+            cpu = None
+        if (
+            gpu
+            and (datetime.now(timezone.utc) - datetime.fromisoformat(gpu["timestamp"])).total_seconds() > 15
+        ):
+            gpu = None
+        return {
+            "cpu_percent": cpu["cpu_percent_all_cores"] if cpu else None,
+            "ram_mb": cpu["rss_bytes"] / 2**20 if cpu else None,
+            "gpu_percent": gpu["busiest_engine_percent"] if gpu else None,
+            "vram_mb": gpu["dedicated_bytes"] / 2**20 if gpu else None,
+            "gpu_sample_at": gpu["timestamp"] if gpu else None,
+        }

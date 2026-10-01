@@ -10,5 +10,20 @@
       "vendor/graders.py": "b75819018d9a636a588f96fb6aeaae3a9e1c91cc391b56adafc384d4275699aa",
       "vendor/task_quality.py": "068ecd4cd556d75602b5cdd823517b60fcda7c56e526bc13ddf16fc41765693c"
     }
+  },
+  "agent-core-v1.1": {
+    "version": "1.1.0",
+    "files": {
+      "scoring.py": "233e44b96f116546fcf30f3759a15e14374177e1904832013afdf4f6651b81c1",
+      "codecheck.py": "badbca7e2ea6e0af9bebc3ad82c5d97c96663c75e98c5a9cf3451c16a8156dce",
+      "longcontext.py": "1c9745fc4949e97b86a78b109cd43763597b1143a562ca40c24031efaf746a2f",
+      "performance.py": "ccb8282768af107911653d305d9720bff0eec2527a259909eaf93461624ee822",
+      "vendor/graders.py": "b75819018d9a636a588f96fb6aeaae3a9e1c91cc391b56adafc384d4275699aa",
+      "vendor/task_quality.py": "068ecd4cd556d75602b5cdd823517b60fcda7c56e526bc13ddf16fc41765693c",
+      "benchmarks/agent-core-v1.1.json": "0955b41a4be247577f2bffa01b3e8007beb707493460041316eebaf7275258de",
+      "answers.py": "798983be29818206f45cb57ae25717776fcca5eab60598531289f665dd108e39",
+      "grading.py": "ea43a6f56ce00a0c380544173e663d7c7338f8fe03301b4da721202886d693ff",
+      "aggregation.py": "9d08fac7df1ca73eb364c71485797efb5d13e5b006dff687ac66d944467a0078"
+    }
   }
 }

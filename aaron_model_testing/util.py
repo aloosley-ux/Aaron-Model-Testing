@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,7 +38,17 @@ def write_json(path: Path, value) -> None:
         f.write(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
         f.flush()
         os.fsync(f.fileno())
-    temp.replace(path)
+    # Windows readers briefly deny replacement while holding a file open.
+    # Keep atomic writes, retry only that transient failure, and bound the wait.
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            temp.replace(path)
+            break
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def command_text(argv: list[str]) -> str:
@@ -53,12 +64,19 @@ def distribution_notices() -> dict[str, Path]:
     """Find redistributable notices in a checkout or an installed wheel."""
     from importlib.metadata import distribution
 
-    names = ("LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/llama-gguf-tune-MIT.txt",
-             "licenses/local_bench-MIT.txt", "licenses/llm-inference-benchmark-MIT.txt")
+    names = (
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses/llama-gguf-tune-MIT.txt",
+        "licenses/local_bench-MIT.txt",
+        "licenses/llm-inference-benchmark-MIT.txt",
+    )
     root = Path(__file__).resolve().parent.parent
     if (root / "pyproject.toml").is_file() and all((root / name).is_file() for name in names):
         return {name: root / name for name in names}
     package = distribution("aaron-model-testing")
     files = package.files or []
-    return {name: Path(package.locate_file(next(f for f in files if str(f).endswith("/licenses/" + name))))
-            for name in names}
+    return {
+        name: Path(package.locate_file(next(f for f in files if str(f).endswith("/licenses/" + name))))
+        for name in names
+    }

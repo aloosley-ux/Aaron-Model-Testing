@@ -5,6 +5,9 @@ aaron_model_testing/scoring.py -text
 aaron_model_testing/codecheck.py -text
 aaron_model_testing/longcontext.py -text
 aaron_model_testing/performance.py -text
+aaron_model_testing/answers.py -text
+aaron_model_testing/grading.py -text
+aaron_model_testing/aggregation.py -text
 aaron_model_testing/vendor/*.py -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 # Preserve upstream licence text, including its final blank line.
 licenses/* whitespace=-blank-at-eof

@@ -19,3 +19,5 @@ The linked full permission/warranty texts are part of these notices. Preserve th
 [kylebakerio/LLM-Tuner](https://github.com/kylebakerio/LLM-Tuner/tree/05a0fb18c70017047eedd859ba7196e372751b5a) (no licence found at inspection) and [7amzaRando/BenchMax](https://github.com/7amzaRando/BenchMax/tree/3dd34db201b4defae6cd6b269891bf186ffa822d) (AGPLv3) were read for ideas only. **No source, prompts, assets or datasets from either were copied.**
 
 Dependencies retain their package licences. The official llama.cpp `gguf` package is installed for metadata reading. Native binaries and weights are user supplied, not redistributed.
+
+The v1.1 reasoning extractor, grading wrapper, live monitor and regrade path are project-authored. V1 questions, reused graders, rubrics and their preserved notices remain unchanged; no additional upstream code was copied for this hardening pass.

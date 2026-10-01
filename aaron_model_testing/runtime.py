@@ -207,9 +207,15 @@ class NativeServer:
         start = time.perf_counter()
         memory = psutil.virtual_memory()
         self.process_memory_limit = int(min(memory.total * 0.85, max(512 * 2**20, memory.available * 0.9)))
-        write_json(self.work / "startup.json", {"memory_limit_bytes": self.process_memory_limit,
-            "available_ram_bytes": memory.available, "gpu_telemetry": self.settings.gpu_telemetry,
-            "removed_inherited_environment_prefix": "LLAMA_"})
+        write_json(
+            self.work / "startup.json",
+            {
+                "memory_limit_bytes": self.process_memory_limit,
+                "available_ram_bytes": memory.available,
+                "gpu_telemetry": self.settings.gpu_telemetry,
+                "removed_inherited_environment_prefix": "LLAMA_",
+            },
+        )
         self.owned = OwnedProcess(
             self.argv,
             self.work / "server.log",
@@ -296,7 +302,7 @@ class NativeServer:
                     elapsed = (time.perf_counter() - start) * 1000
                     delta = (event.get("choices") or [{}])[0].get("delta", {}) if chat else event
                     content = delta.get("content") or ""
-                    thought = delta.get("reasoning_content") or ""
+                    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
                     if content or thought or delta.get("tool_calls"):
                         first = elapsed if first is None else first
                     if content:

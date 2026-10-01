@@ -14,7 +14,7 @@ const num = (v, digits = 1) =>
     : Number(v).toLocaleString(undefined, { maximumFractionDigits: digits });
 const pct = (v) => (v == null ? "—" : `${num(v * 100)}%`);
 const date = (v) => (v ? new Date(v).toLocaleString() : "—");
-const billions = v => typeof v === 'number' ? num(v / 1e9, 2) : '—';
+const billions = (v) => (typeof v === "number" ? num(v / 1e9, 2) : "—");
 const colors = [
   "#087e7c",
   "#719736",
@@ -31,7 +31,66 @@ const state = {
   board: [],
   group: "all",
   polling: false,
+  openRun: null,
+  followJob: null,
 };
+function qualification(r) {
+  const kind = r.request?.qualification || r.qualification || "custom";
+  if (r.smoke || kind === "smoke") return "PIPELINE SMOKE TEST";
+  if (kind === "quick") return "QUICK QUALIFICATION";
+  if (kind === "full") return "FULL QUALIFICATION";
+  if (
+    r.stage === "full" &&
+    r.request?.long_context &&
+    JSON.stringify(r.request.contexts) === "[2048,4096,8192]" &&
+    r.request.repeats === 3 &&
+    !r.request.test_ids
+  )
+    return "FULL QUALIFICATION";
+  return "CUSTOM " + String(r.stage || "benchmark").toUpperCase();
+}
+function duration(seconds) {
+  if (seconds == null) return "—";
+  seconds = Math.max(0, Math.round(seconds));
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s`;
+}
+function resultCards(r, live) {
+  const active = ["running", "queued", "regrading"].includes(r.status);
+  const s = r.summary || {};
+  const label = active
+    ? "LIVE / PARTIAL"
+    : r.status === "completed"
+      ? "FINAL"
+      : "PARTIAL";
+  const generation = active
+    ? live?.generation_tps
+    : s.metrics?.generation_tps?.median;
+  const prompt = active ? live?.prompt_tps : s.metrics?.prompt_tps?.median;
+  const capability = active ? live?.capability : s.capability;
+  const invalid =
+    (active ? live?.capability_status : s.capability_status) === "invalid";
+  return `<div class="cards">${card(`${label} GENERATION`, `${num(generation)} <small>tok/s</small>`, active ? "Rolling median · last 12 successful samples" : "Native decode rate · successful performance samples")}${card(`${label} PROMPT PROCESSING`, `${num(prompt, 0)} <small>tok/s</small>`, active ? "Rolling native timings · prompt cache disabled" : "Prompt cache disabled")}${card(`${label} CAPABILITY`, invalid ? "Unavailable" : capability == null ? (active ? "Pending" : "Not measured") : pct(capability), `${active ? live?.capability_samples || 0 : s.capability_samples || 0} completed capability samples`)}${card(`${label} RELIABILITY`, pct(active ? live?.reliability : s.reliability), `${active ? live?.error_count || 0 : s.errors || 0} inference failures`)}</div>`;
+}
+function livePanel(m) {
+  const l = m.live || {},
+    active = ["running", "queued", "regrading"].includes(l.status);
+  const resources = l.resources || {};
+  return `<div class="panel"><div class="panel-title"><div><h2>${active ? "LIVE RUN" : "RUN FINISHED"}</h2><p>${esc(m.model)} · ${esc(m.profile)} · ${esc(qualification(m))} · ${esc(m.stage)}</p></div>${badge(l.status || "running")}${active && m.job_id ? `<button class="danger" data-action="cancel" data-id="${esc(m.job_id)}">Cancel run</button>` : ""}</div>
+    <progress class="run-progress" aria-label="Overall sample progress" max="1" ${l.progress_fraction == null ? "" : `value="${l.progress_fraction}"`}></progress>
+    <p class="small"><strong>${num(l.completed_samples || 0, 0)} / ${num(l.planned_samples, 0)} samples</strong> · Elapsed ${duration(l.elapsed_seconds)} · Rough ETA ${duration(l.eta_seconds)}</p>
+    <div class="monitor-grid"><div>Phase<strong>${esc(l.phase || "Preparing")}</strong></div><div>Current test<strong>${esc(l.current_test || "—")}</strong></div><div>Context<strong>${num(l.current_context, 0)}</strong></div><div>Repeat<strong>${num(l.current_repeat, 0)}</strong></div><div>Capability passes<strong>${num(l.pass_count || 0, 0)}</strong></div><div>Capability fails<strong>${num(l.fail_count || 0, 0)}</strong></div><div>Inference errors<strong>${num(l.error_count || 0, 0)}</strong></div><div>Unavailable grades<strong>${num(l.invalid_grades || 0, 0)}</strong></div><div>GPU busiest engine<strong>${num(resources.gpu_percent)}%</strong></div><div>Process VRAM<strong>${num(resources.vram_mb, 0)} MB</strong></div><div>CPU all cores<strong>${num(resources.cpu_percent)}%</strong></div><div>Process RAM<strong>${num(resources.ram_mb, 0)} MB</strong></div></div>
+    <p class="small muted">Live values cover completed samples only. ETA assumes the observed average and can change between phases. Progress counts inference samples; load observations are separate. GPU counters are per process and may be sparse or unavailable.</p>
+    <h3>Recent activity</h3><ul class="activity-feed" aria-label="Recent run activity">${
+      (l.events || [])
+        .slice(-30)
+        .reverse()
+        .map(
+          (e) =>
+            `<li><span class="badge ${e.outcome === "PASS" ? "good" : ["FAIL", "ERROR"].includes(e.outcome) ? "bad" : "warn"}">${esc(e.outcome)}</span> ${esc(e.test.replaceAll("_", " "))} · ${num(e.context, 0)}${e.repeat == null ? "" : ` · repeat ${e.repeat}`}</li>`,
+        )
+        .join("") || "<li>Waiting for the first completed sample…</li>"
+    }</ul></div>`;
+}
 async function api(path, method = "GET", body) {
   const r = await fetch("/api" + path, {
     method,
@@ -202,7 +261,7 @@ async function leaderboard() {
       "Find the right model for the job. Compare measured tradeoffs across saved profiles.",
       `<button data-action="scan">Scan models</button>`,
     ) +
-    `<div class="cards">${card("MODELS IN INVENTORY", num(state.models.filter((m) => m.status === "ready").length, 0), "GGUFs registered on this machine")}${card("FASTEST GENERATION", bestGen ? `${num(bestGen)} <small>tok/s</small>` : "—", "Median across successful repeated samples")}${card("HIGHEST CAPABILITY", bestCap ? pct(bestCap) : "—", "Agent core v1 · deterministic checks")}${card("MEASURED PROFILES", num(state.board.length, 0), "Smoke runs excluded from leaderboard")}</div>` +
+    `<div class="cards">${card("MODELS IN INVENTORY", num(state.models.filter((m) => m.status === "ready").length, 0), "GGUFs registered on this machine")}${card("FASTEST GENERATION", bestGen ? `${num(bestGen)} <small>tok/s</small>` : "—", "Median across successful repeated samples")}${card("HIGHEST CAPABILITY", bestCap ? pct(bestCap) : "—", "Agent core v1.1 · deterministic checks")}${card("MEASURED PROFILES", num(state.board.length, 0), "Smoke runs excluded from leaderboard")}</div>` +
     `<div class="grid-two"><div class="panel"><div class="panel-title"><div><h2>Capability × speed</h2><p>Explore the tradeoff. Click a point to inspect its run.</p></div><span class="badge dark">NO COMPOSITE SCORE</span></div>${scatter(plotted)}</div><div class="panel"><h2>Generation throughput</h2><p class="muted small">Decode rate from llama.cpp native timings</p>${rows.length ? bars(rows.slice(0, 7).map((r) => ({ label: r.model_name, value: median(r, "generation_tps") }))) : empty("No measured profiles", "Register a GGUF, save a profile and run your first benchmark.")}</div></div>` +
     `<div class="panel"><div class="panel-title"><div><h2>Measured model profiles</h2><p>Latest result for each configuration and controlled workload</p></div><div class="actions"><select class="pill-select" id="group-select"><option value="all">All workload groups</option>${groups.map((g, i) => `<option value="${g}" ${state.group === g ? "selected" : ""}>Workload ${i + 1} · ${g.slice(0, 8)}</option>`).join("")}</select><button data-action="compare">Compare selected (${state.selected.size})</button></div></div>${
       rows.length
@@ -220,7 +279,7 @@ async function leaderboard() {
             ],
             rows.map(
               (r) =>
-                `<tr><td><input type="checkbox" aria-label="Compare ${esc(r.model_name)}" data-select="${r.run_id}" ${state.selected.has(r.run_id) ? "checked" : ""}></td><td><a href="#model/${r.model_id}"><strong>${esc(r.model_name)}</strong></a><small>${esc(r.quantisation)} · ${esc(r.profile_name)} · workload ${r.comparability_group.slice(0, 8)}</small></td><td class="numeric">${num(median(r, "generation_tps"))}<small>tok/s</small></td><td class="numeric">${num(median(r, "prompt_tps"), 0)}<small>tok/s</small></td><td>${num(median(r, "ttft_ms"), 0)} ms</td><td>${pct(r.summary.capability)}<small>${r.summary.capability_samples || 0} samples</small></td><td>${num(r.ram_peak_mb, 0)} MB<small>VRAM ${num(r.vram_peak_mb, 0)} MB</small></td><td>${pct(r.summary.reliability)}</td><td><a href="#run/${r.run_id}">${badge(r.status)} ↗</a></td></tr>`,
+                `<tr><td><input type="checkbox" aria-label="Compare ${esc(r.model_name)}" data-select="${r.run_id}" ${state.selected.has(r.run_id) ? "checked" : ""}></td><td><a href="#model/${r.model_id}"><strong>${esc(r.model_name)}</strong></a><small>${esc(r.quantisation)} · ${esc(r.profile_name)} · ${esc(qualification(r))} · workload ${r.comparability_group.slice(0, 8)}</small></td><td class="numeric">${num(median(r, "generation_tps"))}<small>tok/s</small></td><td class="numeric">${num(median(r, "prompt_tps"), 0)}<small>tok/s</small></td><td>${num(median(r, "ttft_ms"), 0)} ms</td><td>${r.summary.capability_status === "invalid" ? "Unavailable" : pct(r.summary.capability)}<small>${r.summary.capability_samples || 0} samples</small></td><td>${num(r.ram_peak_mb, 0)} MB<small>VRAM ${num(r.vram_peak_mb, 0)} MB</small></td><td>${pct(r.summary.reliability)}</td><td><a href="#run/${r.run_id}">${badge(r.status)} ↗</a></td></tr>`,
             ),
           )
         : empty(
@@ -233,7 +292,7 @@ async function leaderboard() {
 }
 async function models() {
   await loadCore();
-  const scan = (await api("/jobs")).find(j=>j.kind==='scan' && j.result);
+  const scan = (await api("/jobs")).find((j) => j.kind === "scan" && j.result);
   $("#content").innerHTML =
     head(
       "Model inventory",
@@ -263,7 +322,10 @@ async function models() {
             "Scan a directory or register a single .gguf file. Header metadata and all model bytes are fingerprinted; files remain in their original locations.",
             `<button class="primary" data-action="scan">Scan model directory</button>`,
           )
-    }</div>` + (scan ? `<div class="panel"><h2>Last inventory scan</h2><p class="small muted">${esc(date(scan.finished_at))} · ${scan.result.registered.length} registered · ${scan.result.failures.length} unreadable</p>${scan.result.failures.length ? `<pre>${esc(JSON.stringify(scan.result.failures,null,2))}</pre>` : '<span class="badge good">All discovered files registered</span>'}</div>` : '');
+    }</div>` +
+    (scan
+      ? `<div class="panel"><h2>Last inventory scan</h2><p class="small muted">${esc(date(scan.finished_at))} · ${scan.result.registered.length} registered · ${scan.result.failures.length} unreadable</p>${scan.result.failures.length ? `<pre>${esc(JSON.stringify(scan.result.failures, null, 2))}</pre>` : '<span class="badge good">All discovered files registered</span>'}</div>`
+      : "");
 }
 async function modelDetail(id) {
   const m = await api("/models/" + id);
@@ -283,10 +345,12 @@ async function modelDetail(id) {
     `${
       latest
         ? `<div class="grid-two"><div class="panel"><h2>Latest measured performance</h2>${curves([latest], "generation_tps", "Generation tok/s")}</div><div class="panel"><h2>Latest capability categories</h2>${bars(
-            Object.entries(latest.summary.categories || {}).map(([k, v]) => ({
-              label: k.replaceAll("_", " "),
-              value: v.score * 100,
-            })),
+            Object.entries(latest.summary.categories || {})
+              .filter(([, v]) => v.score != null)
+              .map(([k, v]) => ({
+                label: k.replaceAll("_", " "),
+                value: v.score * 100,
+              })),
             "%",
             100,
           )}</div></div>`
@@ -310,7 +374,7 @@ function runTable(rows) {
         ],
         rows.map(
           (r) =>
-            `<tr><td><input type="checkbox" data-select="${r.id}" aria-label="Select run ${r.id}" ${state.selected.has(r.id) ? "checked" : ""}></td><td><a href="#run/${r.id}">${esc(date(r.created_at))}</a><small class="mono">${r.id.slice(0, 10)}</small></td><td>${esc(state.models.find((m) => m.id === r.model_id)?.name || r.model_id)}<small>${esc(r.profile?.name)}</small></td><td>${esc(r.stage)} ${r.smoke ? '<span class="badge warn">SMOKE</span>' : ""}</td><td>${r.sample_count}</td><td>${num(median(r, "generation_tps"))} tok/s</td><td>${pct(r.summary?.reliability)}</td><td>${badge(r.status)}</td></tr>`,
+            `<tr><td><input type="checkbox" data-select="${r.id}" aria-label="Select run ${r.id}" ${state.selected.has(r.id) ? "checked" : ""}></td><td><a href="#run/${r.id}">${esc(date(r.created_at))}</a><small class="mono">${r.id.slice(0, 10)}</small></td><td>${esc(state.models.find((m) => m.id === r.model_id)?.name || r.model_id)}<small>${esc(r.profile?.name)}</small></td><td>${esc(qualification(r))}${r.regrade ? "<small>REGRADED</small>" : ""}</td><td>${r.sample_count}</td><td>${["running", "queued"].includes(r.status) ? "LIVE / PARTIAL " : ""}${num(median(r, "generation_tps"))} tok/s</td><td>${pct(r.summary?.reliability)}</td><td>${badge(r.status)}</td></tr>`,
         ),
       )
     : empty(
@@ -334,25 +398,40 @@ async function runDetail(id) {
     caps = records.filter((t) => t.type === "capability"),
     candidates = records.filter((t) => t.type === "candidate");
   const metrics = s.metrics || {};
+  const active = ["running", "queued", "regrading"].includes(r.status);
+  const monitor = active ? await api(`/runs/${id}/live`) : null;
+  state.openRun = {
+    id,
+    status: r.status,
+    completed: r.live?.completed_samples,
+  };
   $("#content").innerHTML =
     head(
       r.model.name,
-      `${r.profile.name} · ${r.stage} · ${date(r.created_at)}`,
-      `<span>${badge(r.status)}</span><a class="primary" style="padding:9px 14px;border-radius:8px" href="/api/runs/${id}/artifacts">Download artifacts</a>`,
+      `${r.profile.name} · ${qualification(r)} · ${date(r.created_at)}`,
+      `<span>${badge(r.status)}</span>${active ? "" : `<a class="primary" style="padding:9px 14px;border-radius:8px" href="/api/runs/${id}/artifacts">Download artifacts</a>`}${["completed", "partial"].includes(r.status) && s.capability_samples && !r.regrade ? `<button data-action="regrade" data-id="${id}">Regrade saved responses</button>` : ""}`,
     ) +
     (r.smoke
       ? '<div class="notice warning">Pipeline smoke test. These measurements validate the workflow and are excluded from the leaderboard.</div>'
       : "") +
     (r.error ? `<div class="notice warning">${esc(r.error)}</div>` : "") +
-    `<div class="cards">${card("GENERATION", `${num(metrics.generation_tps?.median)} <small>tok/s</small>`, "Native decode rate · successful samples")}${card("PROMPT PROCESSING", `${num(metrics.prompt_tps?.median, 0)} <small>tok/s</small>`, "Prompt cache disabled")}${card("CAPABILITY", pct(s.capability), `${s.capability_samples || 0} graded samples`)}${card("RELIABILITY", pct(s.reliability), `${s.errors || 0} inference failures`)}</div>` +
+    (r.regrade
+      ? `<div class="notice">REGRADED from <a href="#run/${esc(r.regrade.source_run_id)}">${esc(r.regrade.source_run_id)}</a>. Inference evidence is preserved unchanged; grading uses ${esc(r.grader_version)}. No inference was rerun.</div>`
+      : "") +
+    (s.capability_warning
+      ? `<div class="notice warning">${esc(s.capability_warning)}</div>`
+      : "") +
+    `<div id="live-monitor">${monitor ? livePanel(monitor) : ""}</div><div id="run-cards">${resultCards(r, monitor?.live)}</div>` +
     `<div class="grid-two"><div class="panel"><h2>Generation across contexts</h2>${curves([r], "generation_tps", "Generation tok/s")}</div><div class="panel"><h2>Capability by category</h2>${
-      Object.keys(s.categories || {}).length
+      Object.values(s.categories || {}).some((v) => v.score != null)
         ? bars(
-            Object.entries(s.categories).map(([k, v]) => ({
-              label: k.replaceAll("_", " "),
-              value: v.score * 100,
-              color: colors[0],
-            })),
+            Object.entries(s.categories)
+              .filter(([, v]) => v.score != null)
+              .map(([k, v]) => ({
+                label: k.replaceAll("_", " "),
+                value: v.score * 100,
+                color: colors[0],
+              })),
             "%",
             100,
           )
@@ -395,7 +474,7 @@ async function runDetail(id) {
             ["Test", "Category", "Context", "Repeat", "Score", "Result"],
             caps.map(
               (t) =>
-                `<tr class="test-result" tabindex="0" data-action="inspect" data-run="${id}" data-id="${t.id}"><td>${esc(t.test_id)}</td><td>${esc(t.category)}</td><td>${t.context_size}</td><td>${t.repeat + 1}</td><td>${pct(t.grade.score)}</td><td>${t.grade.passed ? '<span class="badge good">pass</span>' : `<span class="badge bad" title="${esc(t.grade.detail)}">fail</span>`}</td></tr>`,
+                `<tr class="test-result" tabindex="0" data-action="inspect" data-run="${id}" data-id="${t.id}"><td>${esc(t.test_id)}</td><td>${esc(t.category)}</td><td>${t.context_size}</td><td>${t.repeat + 1}</td><td>${t.legacy_grading_warning ? "Unvalidated" : pct(t.grade.score)}</td><td>${t.legacy_grading_warning ? '<span class="badge warn">historical</span>' : t.grade.valid === false ? '<span class="badge warn">unavailable</span>' : t.grade.passed ? '<span class="badge good">pass</span>' : `<span class="badge bad" title="${esc(t.grade.detail)}">fail</span>`}</td></tr>`,
             ),
           )
         : empty(
@@ -551,9 +630,40 @@ async function runModal(modelId) {
   const profiles = state.profiles.filter((p) => p.model_id === chosen);
   modal(
     "New benchmark",
-    `<form id="run-form"><div class="form-grid"><label class="field">Model<select name="model_id" id="run-model">${ready.map((m) => `<option value="${m.id}" ${m.id === chosen ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></label><label class="field">Saved profile<select name="profile_id" id="run-profile" required>${profiles.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.config_sha256.slice(0, 7)}</option>`).join("")}</select></label></div><button type="button" class="link-button" data-action="profile" data-id="${chosen}">+ Create a profile</button><div class="hr"></div><div class="form-grid"><label class="field">Stage<select name="stage" id="run-stage"><option value="full">Performance + capability</option><option value="optimise">Automatic optimisation</option><option value="performance">Performance only</option><option value="capability">Capability only</option></select></label><label class="field">Repeats<input name="repeats" type="number" min="3" max="10" value="3" required></label></div><label class="checkbox"><input name="smoke" type="checkbox"> Pipeline smoke test (small subset; excluded from leaderboard)</label><div class="form-grid"><label class="field">Context sizes, comma separated<input name="contexts" value="2048,4096,8192" required></label><label class="field">Performance generation tokens<input name="generation_tokens" type="number" value="128" min="16" max="1024"></label></div><label class="checkbox"><input name="long_context" type="checkbox" checked> Include long-context capability matrix (can take substantial time)</label><details><summary>Optimisation depth and profile objective</summary><div class="form-grid"><label class="field">Search preset<select name="preset"><option>quick</option><option>standard</option><option>thorough</option><option>drill</option></select></label><label class="field">Save winner as<select name="profile_name"><option>BALANCED</option><option>FAST</option><option>SMART</option></select></label><label class="field">Optional tuning contexts (comma separated)<input name="tune_contexts" placeholder="Blank = selected profile context"></label><label class="field">Load observations per context<input name="load_repeats" type="number" value="3" min="1" max="5"></label><label class="field">Candidate budget (blank = preset default)<input name="candidate_limit" type="number" min="1" max="128"></label></div><p class="small muted">Quick 8 → standard 24 → thorough 64 → drill 32 around your selected profile. Every candidate repeats at least three times. SMART uses your profile's chosen context and reasoning settings; its intelligence is assessed separately.</p></details><div class="dialog-footer"><button class="primary" ${profiles.length ? "" : "disabled"}>Queue benchmark</button></div></form>`,
+    `<form id="run-form"><div class="form-grid"><label class="field">Model<select name="model_id" id="run-model">${ready.map((m) => `<option value="${m.id}" ${m.id === chosen ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></label><label class="field">Saved profile<select name="profile_id" id="run-profile" required>${profiles.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.config_sha256.slice(0, 7)}</option>`).join("")}</select></label></div><button type="button" class="link-button" data-action="profile" data-id="${chosen}">+ Create a profile</button><div class="hr"></div><label class="field">Qualification preset<select name="qualification" id="qualification"><option value="quick">QUICK QUALIFICATION</option><option value="full">FULL QUALIFICATION</option><option value="smoke">PIPELINE SMOKE TEST</option><option value="custom">Custom benchmark / optimisation</option></select></label><p class="small muted" id="qualification-note">Quick: performance at 2048 / 8192, standard capability suite at the saved profile context, 3 repeats, long-context matrix off. Leaderboard eligible.</p><div class="form-grid"><label class="field">Stage<select name="stage" id="run-stage"><option value="full">Performance + capability</option><option value="optimise">Automatic optimisation</option><option value="performance">Performance only</option><option value="capability">Capability only</option></select></label><label class="field">Repeats<input name="repeats" type="number" min="3" max="10" value="3" required></label></div><label class="checkbox"><input name="smoke" type="checkbox"> Pipeline smoke test (custom mode; excluded from leaderboard)</label><div class="form-grid"><label class="field">Context sizes, comma separated<input name="contexts" value="2048,4096,8192" required></label><label class="field">Performance generation tokens<input name="generation_tokens" type="number" value="128" min="16" max="1024"></label></div><label class="checkbox"><input name="long_context" type="checkbox" checked> Include long-context capability matrix (can take substantial time)</label><details><summary>Optimisation depth and profile objective</summary><div class="form-grid"><label class="field">Search preset<select name="preset"><option>quick</option><option>standard</option><option>thorough</option><option>drill</option></select></label><label class="field">Save winner as<select name="profile_name"><option>BALANCED</option><option>FAST</option><option>SMART</option></select></label><label class="field">Optional tuning contexts (comma separated)<input name="tune_contexts" placeholder="Blank = selected profile context"></label><label class="field">Load observations per context<input name="load_repeats" type="number" value="3" min="1" max="5"></label><label class="field">Candidate budget (blank = preset default)<input name="candidate_limit" type="number" min="1" max="128"></label></div><p class="small muted">Quick 8 → standard 24 → thorough 64 → drill 32 around your selected profile. Every candidate repeats at least three times. SMART uses your profile's chosen context and reasoning settings; its intelligence is assessed separately.</p></details><div class="dialog-footer"><button class="primary" ${profiles.length ? "" : "disabled"}>Queue benchmark</button></div></form>`,
   );
+  applyQualification();
 }
+function applyQualification() {
+  const form = $("#run-form"),
+    kind = form.elements.qualification.value;
+  const custom = kind === "custom";
+  const values = {
+    stage: "full",
+    repeats: "3",
+    contexts: kind === "quick" ? "2048,8192" : "2048,4096,8192",
+    generation_tokens: "128",
+    load_repeats: "3",
+  };
+  for (const [name, value] of Object.entries(values)) {
+    if (!custom) form.elements[name].value = value;
+    form.elements[name].disabled = !custom;
+  }
+  for (const name of ["smoke", "long_context"]) {
+    if (!custom)
+      form.elements[name].checked =
+        name === "smoke" ? kind === "smoke" : kind === "full";
+    form.elements[name].disabled = !custom;
+  }
+  $("#qualification-note").textContent = custom
+    ? "Choose explicit settings for a custom benchmark or optimisation."
+    : kind === "full"
+      ? "Full: performance at 2048 / 4096 / 8192, complete standard suite at the profile context, 3 repeats, long-context matrix at 10% / 50% / 90%. Leaderboard eligible."
+      : kind === "smoke"
+        ? "Smoke: short performance requests and the existing basic capability subset. Excluded from the leaderboard."
+        : "Quick: performance at 2048 / 8192, complete standard suite at the profile context, 3 repeats, long-context matrix off. Leaderboard eligible.";
+}
+
 async function inspector(runId, sampleId) {
   const r = await api(`/runs/${runId}/responses/${sampleId}`);
   if (r.type !== "capability") {
@@ -562,7 +672,7 @@ async function inspector(runId, sampleId) {
   }
   modal(
     r.test_id,
-    `<p>${r.grade.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>'} ${pct(r.grade.score)} · ${esc(r.category)} · context ${r.context_size} · repeat ${r.repeat + 1}</p><div class="notice ${r.grade.passed ? "" : "warning"}">${esc(r.grade.detail)} ${esc(r.error || "")}</div><h3>Exact prompt</h3><pre>${esc(JSON.stringify(r.test?.messages || r.request?.messages, null, 2))}</pre><h3>Expected result / scoring rule</h3><pre>${esc(JSON.stringify(r.test?.rule, null, 2))}</pre><h3>Raw model answer</h3><pre>${esc(r.response || "(No final answer)")}</pre><h3>Native tool calls</h3><pre>${esc(JSON.stringify(r.tool_calls || [], null, 2))}</pre><details><summary>Raw reasoning</summary><pre>${esc(r.reasoning || "(None returned)")}</pre></details><details><summary>Timing, grade and exact runtime configuration</summary><pre>${esc(JSON.stringify({ metrics: r.metrics, finish_reason: r.finish_reason, grade: r.grade, runtime_config: r.runtime_config, test_sha256: r.test_sha256, prompt_sha256: r.prompt_sha256, insertion_positions: r.test?.insertion_positions }, null, 2))}</pre></details><details><summary>Full request and stream</summary><pre>${esc(JSON.stringify({ request: r.request, events: r.events }, null, 2))}</pre></details>`,
+    `<p>${r.legacy_grading_warning ? '<span class="badge warn">UNVALIDATED HISTORICAL GRADE</span>' : r.grade.valid === false ? '<span class="badge warn">UNAVAILABLE</span>' : r.grade.passed ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>'} ${r.legacy_grading_warning ? "" : pct(r.grade.score)} · ${esc(r.category)} · context ${r.context_size} · repeat ${r.repeat + 1}</p><div class="notice ${r.grade.passed ? "" : "warning"}">${esc(r.legacy_grading_warning || r.grade.detail)} ${esc(r.error || "")}</div><h3>Exact prompt</h3><pre>${esc(JSON.stringify(r.test?.messages || r.request?.messages, null, 2))}</pre><h3>Expected result / scoring rule</h3><pre>${esc(JSON.stringify(r.test?.rule, null, 2))}</pre><h3>Raw model answer</h3><pre>${esc(r.response || "(No final answer)")}</pre><h3>Final answer used for grading</h3><pre>${esc(r.final_answer ?? "(Unavailable in this historical sample)")}</pre><h3>Native tool calls</h3><pre>${esc(JSON.stringify(r.tool_calls || [], null, 2))}</pre><details><summary>Raw reasoning</summary><pre>${esc(r.reasoning || "(None returned)")}</pre></details><details><summary>Timing, grade and exact runtime configuration</summary><pre>${esc(JSON.stringify({ metrics: r.metrics, finish_reason: r.finish_reason, grade: r.grade, runtime_config: r.runtime_config, test_sha256: r.test_sha256, prompt_sha256: r.prompt_sha256, answer_extraction: r.answer_extraction, previous_grade: r.previous_grade, insertion_positions: r.test?.insertion_positions }, null, 2))}</pre></details><details><summary>Full request and stream</summary><pre>${esc(JSON.stringify({ request: r.request, events: r.events }, null, 2))}</pre></details>`,
   );
 }
 async function render() {
@@ -655,6 +765,18 @@ document.addEventListener("click", async (event) => {
         toast("Cancellation requested; owned processes are shutting down");
         await poll();
         break;
+      case "regrade": {
+        el.disabled = true;
+        try {
+          toast("Regrading preserved responses; no inference is running…");
+          const derived = await api(`/runs/${id}/regrade`, "POST");
+          location.hash = "run/" + derived.id;
+          await render();
+        } finally {
+          el.disabled = false;
+        }
+        break;
+      }
       case "refresh":
         await render();
         break;
@@ -679,6 +801,7 @@ document.addEventListener("change", (event) => {
     state.group = el.value;
     render();
   }
+  if (el.id === "qualification") applyQualification();
   if (el.id === "run-model") {
     const pp = state.profiles.filter((p) => p.model_id === el.value);
     $("#run-profile").innerHTML = pp
@@ -725,20 +848,22 @@ document.addEventListener("submit", async (event) => {
       case "run-form": {
         const body = {
           ...data,
-          repeats: Number(data.repeats),
-          contexts: data.contexts.split(",").map(Number),
-          generation_tokens: Number(data.generation_tokens),
-          smoke: !!data.smoke,
-          long_context: !!data.long_context,
+          stage: form.elements.stage.value,
+          repeats: Number(form.elements.repeats.value),
+          contexts: form.elements.contexts.value.split(",").map(Number),
+          generation_tokens: Number(form.elements.generation_tokens.value),
+          smoke: form.elements.smoke.checked,
+          long_context: form.elements.long_context.checked,
         };
         body.candidate_limit = data.candidate_limit
           ? Number(data.candidate_limit)
           : null;
-        body.load_repeats = Number(data.load_repeats);
+        body.load_repeats = Number(form.elements.load_repeats.value);
         body.tune_contexts = data.tune_contexts
           ? data.tune_contexts.split(",").map(Number)
           : null;
-        await api("/runs", "POST", body);
+        const queued = await api("/runs", "POST", body);
+        state.followJob = queued.id;
         $("#modal").close();
         location.hash = "runs";
         await render();
@@ -794,6 +919,35 @@ async function poll() {
           `<div><span><span class="progress ${j.status === "running" ? "running" : ""}">${esc(j.status)}</span> ${esc(j.progress)} ${j.run_id ? `<a href="#run/${j.run_id}">Inspect run ↗</a>` : ""}</span><button class="danger" data-action="cancel" data-id="${j.id}">Cancel</button></div>`,
       )
       .join("");
+    const followed = jobs.find((j) => j.id === state.followJob);
+    if (followed?.run_id) {
+      state.followJob = null;
+      location.hash = "run/" + followed.run_id;
+      await render();
+    } else if (followed && !["running", "queued"].includes(followed.status)) {
+      state.followJob = null;
+      if (followed.error) toast(followed.error);
+    }
+    const [view, runId] = location.hash.slice(1).split("/");
+    if (
+      view === "run" &&
+      state.openRun?.id === runId &&
+      ["running", "queued", "regrading"].includes(state.openRun.status)
+    ) {
+      const monitor = await api(`/runs/${runId}/live`);
+      if (
+        monitor.live.status !== state.openRun.status ||
+        monitor.live.completed_samples !== state.openRun.completed
+      ) {
+        await runDetail(runId);
+      } else if ($("#live-monitor")) {
+        $("#live-monitor").innerHTML = livePanel(monitor);
+        $("#run-cards").innerHTML = resultCards(
+          { status: monitor.live.status, summary: monitor.summary },
+          monitor.live,
+        );
+      }
+    }
     if (previousActive && !active.length) {
       await render();
       const last = jobs[0];

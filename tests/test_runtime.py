@@ -103,6 +103,61 @@ def test_failed_stream_keeps_partial_answer(tmp_path):
     server.close()
 
 
+def test_reasoning_alias_embedded_content_and_streamed_native_tools(tmp_path):
+    from aaron_model_testing.grading import grade_result
+
+    server = NativeServer(
+        Settings(),
+        {"path": "a.gguf"},
+        RuntimeConfig(),
+        {"path": "unused", "help": "--load-mode"},
+        tmp_path,
+        threading.Event(),
+    )
+    events = [
+        {"choices": [{"delta": {"reasoning": "native reasoning"}}]},
+        {"choices": [{"delta": {"content": "<think>embedded</think>"}}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "call-1", "function": {"name": "lookup", "arguments": '{"x":'}}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "2}"}}]},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"completion_tokens": 10, "prompt_tokens": 30},
+        },
+    ]
+    data = "".join("data: " + json.dumps(e) + "\n\n" for e in events) + "data: [DONE]\n\n"
+    server.client.close()
+    server.client = httpx.Client(
+        base_url="http://127.0.0.1:1235",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=data)),
+    )
+    try:
+        result = server.request({})
+        assert result["reasoning"] == "native reasoning"
+        assert result["response"] == "<think>embedded</think>" and result["events"] == events
+        fields = grade_result(
+            result, {"type": "tool", "name": "lookup", "schema": {"type": "object"}, "arguments": {"x": 2}}
+        )
+        assert fields["grade"]["passed"]
+        assert fields["reasoning"] == "native reasoning"
+        assert result["tool_calls"][0]["function"]["arguments"] == '{"x":2}'
+    finally:
+        server.close()
+
+
 def test_own_process_cleanup_and_no_global_kill(tmp_path, monkeypatch):
     monkeypatch.setenv("LLAMA_ARG_PORT", "1234")
     script = tmp_path / "owned.py"

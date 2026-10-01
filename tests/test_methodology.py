@@ -60,14 +60,14 @@ def test_long_context_determinism_token_budget_and_actual_depths(kind):
 
 def test_immutable_version_detects_scoring_changes(tmp_path, monkeypatch):
     root = suite_module.ROOT
-    for relative in suite_module.load_suite()[1]["files"]:
+    for relative in suite_module.load_suite("agent-core-v1")[1]["files"]:
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / relative, target)
     shutil.copyfile(root / "benchmarks/versions.lock.json", tmp_path / "benchmarks/versions.lock.json")
     monkeypatch.setattr(suite_module, "ROOT", tmp_path)
-    assert suite_module.load_suite()[0]["id"] == "agent-core-v1"
+    assert suite_module.load_suite("agent-core-v1")[0]["id"] == "agent-core-v1"
     with (tmp_path / "scoring.py").open("a") as f:
         f.write("\n# accidental change\n")
     with pytest.raises(ValueError, match="Immutable benchmark version changed"):
-        suite_module.load_suite()
+        suite_module.load_suite("agent-core-v1")

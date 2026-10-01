@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aaron-model-testing"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reproducible local GGUF optimisation, performance and capability benchmarks"
 readme = "README.md"
 requires-python = ">=3.12"

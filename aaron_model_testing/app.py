@@ -224,7 +224,51 @@ def create_app(home: Path | None = None):
             raise ValueError("Select a text model and one of its saved profiles")
         return app.state.manager.submit("run", request.model_dump())
 
+    legacy_cache = {}
+
+    def presentation(record):
+        # Read-only warning for preserved historical grades affected by embedded thinking.
+        if record.get("benchmark", {}).get("id") != "agent-core-v1" or not record.get("summary", {}).get(
+            "capability_samples"
+        ):
+            return record
+        path = home / "artifacts" / record["id"] / "records.jsonl"
+        if not path.is_file():
+            return record
+        stat = path.stat()
+        key = (record["id"], stat.st_mtime_ns, stat.st_size)
+        affected = legacy_cache.get(key)
+        if affected is None:
+            affected = False
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        sample = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if sample.get("type") == "capability" and sample.get("response", "").lstrip().startswith(
+                        "<think>"
+                    ):
+                        affected = True
+                        break
+            if len(legacy_cache) >= 128:
+                legacy_cache.clear()
+            legacy_cache[key] = affected
+        if affected:
+            summary = {
+                **record["summary"],
+                "capability": None,
+                "capability_status": "invalid",
+                "capability_warning": "Historical v1 grading included embedded reasoning. Regrade preserved artifacts; original grades remain evidence.",
+                "categories": {
+                    k: {**v, "score": None} for k, v in record["summary"].get("categories", {}).items()
+                },
+            }
+            return {**record, "summary": summary}
+        return record
+
     def run_brief(record):
+        record = presentation(record)
         return {
             k: v
             for k, v in record.items()
@@ -235,9 +279,23 @@ def create_app(home: Path | None = None):
     def runs():
         return [run_brief(r) for r in app.state.store.all("runs")]
 
+    @app.get("/api/runs/{run_id}/live")
+    def live(run_id: str):
+        record = presentation(get("runs", run_id))
+        result = app.state.manager.monitor(run_id)
+        result["summary"] = record["summary"]
+        return result
+
+    @app.post("/api/runs/{run_id}/regrade", status_code=201)
+    def regrade_run(run_id: str):
+        from .regrade import regrade
+
+        get("runs", run_id)
+        return run_brief(regrade(app.state.store, run_id))
+
     @app.get("/api/runs/{run_id}")
     def run(run_id: str, include_raw: bool = False):
-        record = get("runs", run_id)
+        record = presentation(get("runs", run_id))
         records = []
         path = home / "artifacts" / run_id / "records.jsonl"
         if path.exists():
@@ -245,6 +303,14 @@ def create_app(home: Path | None = None):
                 for line in f:
                     try:
                         sample = json.loads(line)
+                        if (
+                            record.get("benchmark", {}).get("id") == "agent-core-v1"
+                            and sample.get("type") == "capability"
+                            and sample.get("response", "").lstrip().startswith("<think>")
+                        ):
+                            sample["legacy_grading_warning"] = (
+                                "Original v1 grade included embedded reasoning; regrade required"
+                            )
                         records.append(
                             sample
                             if include_raw
@@ -256,6 +322,10 @@ def create_app(home: Path | None = None):
                                     "events",
                                     "response",
                                     "reasoning",
+                                    "native_reasoning",
+                                    "embedded_reasoning",
+                                    "previous_reasoning",
+                                    "final_answer",
                                     "request",
                                     "test",
                                     "runtime_config",
@@ -279,7 +349,7 @@ def create_app(home: Path | None = None):
     @app.get("/api/runs/{run_id}/artifacts")
     def export(run_id: str):
         record = get("runs", run_id)
-        if record["status"] in ("running", "queued"):
+        if record["status"] in ("running", "queued", "regrading"):
             raise RuntimeError("Export after the run finishes to get a consistent archive")
         folder = home / "artifacts" / run_id
         path = home / "exports" / (run_id + ".zip")
@@ -310,6 +380,7 @@ def create_app(home: Path | None = None):
             if key in seen:
                 continue
             seen.add(key)
+            r = presentation(r)
             lifecycle = [s for s in run(r["id"])["records"] if s.get("type") == "lifecycle"]
             ram = [s.get("resources", {}).get("ram_peak_mb") for s in lifecycle]
             output.append(

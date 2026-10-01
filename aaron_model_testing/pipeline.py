@@ -10,13 +10,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .aggregation import aggregate
 from .config import Settings
+from .grading import GRADER_VERSION, grade_result
 from .inventory import discover, register, verify_model
+from .live import EVENT_LIMIT, activity, snapshot
 from .longcontext import KINDS, build_case
-from .performance import distribution, summarize, workload
+from .performance import summarize, workload
 from .profiles import RuntimeConfig
 from .runtime import NativeServer, allocations, environment, probe
-from .scoring import score
 from .suite import ROOT, load_suite
 from .tuning import candidates, objective
 from .util import digest, distribution_notices, file_hash, now, write_json
@@ -28,6 +30,7 @@ class RunRequest(BaseModel):
     profile_id: str
     stage: Literal["full", "performance", "capability", "optimise"] = "full"
     smoke: bool = False
+    qualification: Literal["custom", "quick", "full", "smoke"] = "custom"
     contexts: list[int] = Field(default_factory=lambda: [2048, 4096, 8192], min_length=1, max_length=6)
     repeats: int = Field(default=3, ge=3, le=10)
     generation_tokens: int = Field(default=128, ge=16, le=1024)
@@ -42,6 +45,18 @@ class RunRequest(BaseModel):
 
     @model_validator(mode="after")
     def valid(self):
+        if self.qualification != "custom":
+            if self.stage != "full" or self.test_ids is not None:
+                raise ValueError(
+                    "Qualification presets require performance + the complete standard capability suite"
+                )
+            self.smoke = self.qualification == "smoke"
+            self.contexts = [2048, 8192] if self.qualification == "quick" else [2048, 4096, 8192]
+            self.repeats = 3
+            self.long_context = self.qualification == "full"
+            self.depths = [0.1, 0.5, 0.9]
+            self.generation_tokens = 128
+            self.load_repeats = 3
         if len(set(self.contexts)) != len(self.contexts) or any(
             not 512 <= n <= 262144 for n in self.contexts
         ):
@@ -70,14 +85,12 @@ class ArtifactRun:
         self.store.put("runs", self.record)
 
     def summary(self):
-        result = summarize(self.records)
-        life = [r for r in self.records if r.get("type") == "lifecycle"]
-        result["metrics"]["load_ms"] = distribution([r.get("load_ms") for r in life])
-        result["resources"] = {
-            key: distribution([r.get("resources", {}).get(key) for r in life])
-            for key in ("ram_peak_mb", "vram_peak_mb", "cpu_mean_percent", "gpu_utilisation_percent")
-        }
-        return result
+        return aggregate(self.records)
+
+    def phase(self, phase, **values):
+        live = self.record.setdefault("live", {"events": []})
+        live.update({"phase": phase, "current_test": None, "current_repeat": None, **values})
+        self.save()
 
     def append(self, result):
         import os
@@ -89,10 +102,17 @@ class ArtifactRun:
         os.fsync(self.file.fileno())
         self.record["sample_count"] = len(self.records)
         self.record["summary"] = self.summary()
+        live = self.record.setdefault("live", {"events": []})
+        event = activity(result)
+        if event:
+            live["events"] = [*live.get("events", []), event][-EVENT_LIMIT:]
+        self.record["live"] = snapshot(self.record, self.records)
         self.save()
 
     def finish(self, status, error=None):
         self.record.update(status=status, error=error, finished_at=now())
+        self.record["live"] = snapshot(self.record, self.records)
+        self.record["live"]["phase"] = status
         self.record["summary"] = self.summary()
         write_json(self.path / "summary.json", self.record["summary"])
         self.save()
@@ -102,7 +122,7 @@ class ArtifactRun:
         files = {
             str(p.relative_to(self.path)).replace("\\", "/"): file_hash(p)
             for p in self.path.rglob("*")
-            if p.is_file() and p.name != "checksums.json"
+            if p.is_file() and p != self.path / "checksums.json"
         }
         write_json(self.path / "checksums.json", files)
         self.file.close()
@@ -163,6 +183,41 @@ class JobManager:
                 if server and server.owned:
                     server.owned.close()
             return True
+
+    def monitor(self, run_id):
+        record = self.store.get("runs", run_id)
+        if record is None:
+            raise ValueError("Run not found")
+        resources = None
+        with self.lock:
+            if self.active and self.active[0] == record.get("job_id"):
+                telemetry = getattr(self.active[1], "telemetry", None)
+                if telemetry:
+                    resources = telemetry.snapshot()
+        # Sample counters are persisted on append; recalculate only the wall clock/ETA here.
+        live = dict(record.get("live", {}))
+        if record["status"] in ("running", "queued"):
+            from datetime import datetime, timezone
+
+            elapsed = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(record["created_at"])
+            ).total_seconds()
+            live["elapsed_seconds"] = max(0, elapsed)
+            done, planned = live.get("completed_samples"), record.get("planned_samples")
+            live["eta_seconds"] = elapsed / done * max(0, planned - done) if done and planned else None
+        live.update(
+            status=record["status"], resources=resources or {}, planned_samples=record.get("planned_samples")
+        )
+        return {
+            "id": run_id,
+            "model": record["model"]["name"],
+            "profile": record["profile"]["name"],
+            "stage": record["stage"],
+            "qualification": record["request"].get("qualification", "custom"),
+            "job_id": record.get("job_id"),
+            "summary": record["summary"],
+            "live": live,
+        }
 
     def shutdown(self):
         with self.lock:
@@ -273,6 +328,7 @@ class JobManager:
             "profile": profile,
             "request": request.model_dump(),
             "benchmark": {"id": suite["id"], "lock": lock},
+            "grader_version": GRADER_VERSION,
             "summary": {},
             "sample_count": 0,
             "commands": [],
@@ -284,6 +340,7 @@ class JobManager:
         record["model"]["metadata_artifact"] = "model.json"
         record["model"]["chat_template_sha256"] = digest(model.get("chat_template"))
         self.update(job_id, run_id=run_id, progress="Verifying all model bytes against registered SHA256")
+        artifact.phase("Verifying model hashes")
         try:
             verify_model(model, cancel)
             build = probe(self.settings.server_binary)
@@ -355,6 +412,7 @@ class JobManager:
             raise
 
     def launch(self, job_id, model, config, build, artifact, name, cancel):
+        artifact.phase("Loading", current_context=config.ctx_size)
         server = NativeServer(self.settings, model, config, build, artifact.path / name, cancel)
         with self.lock:
             self.active = (job_id, server)
@@ -418,6 +476,8 @@ class JobManager:
         best = None
         best_value = None
         best_key = None
+        artifact.record["planned_samples"] = len(options) * request.repeats
+        artifact.save()
         for i, config in enumerate(options):
             if cancel.is_set():
                 raise InterruptedError("Optimisation cancelled")
@@ -436,6 +496,12 @@ class JobManager:
                 )
                 write_json(artifact.path / name / "warmup.json", warmup)
                 for rep in range(request.repeats):
+                    artifact.phase(
+                        "Optimisation",
+                        current_context=config.ctx_size,
+                        current_test=f"candidate {i + 1}",
+                        current_repeat=rep + 1,
+                    )
                     sample = workload(server, 256, 128, rep)
                     sample.update(type="tuning_performance", candidate=i + 1, context_size=config.ctx_size)
                     artifact.append(sample)
@@ -511,6 +577,9 @@ class JobManager:
             if do_cap and request.long_context and not request.smoke
             else 0
         )
+        artifact.record["planned_samples"] = artifact.record["planned_capability_samples"] + (
+            (1 if request.smoke else len(request.contexts)) * request.repeats if do_perf else 0
+        )
         artifact.save()
         base_done = False
         for context in contexts:
@@ -541,6 +610,12 @@ class JobManager:
                 write_json(artifact.path / name / "warmup.json", warmup)
                 if perf_here:
                     for rep in range(request.repeats):
+                        artifact.phase(
+                            "Performance",
+                            current_context=context,
+                            current_test="throughput",
+                            current_repeat=rep + 1,
+                        )
                         self.update(
                             job_id,
                             progress=f"Performance: context {context}, repeat {rep + 1}/{request.repeats}",
@@ -570,6 +645,9 @@ class JobManager:
                     budget = min(base.sampling.token_budget, context // 4)
                     for depth in request.depths:
                         for kind in KINDS:
+                            artifact.phase(
+                                "Building long-context case", current_context=context, current_test=kind
+                            )
                             case = build_case(
                                 kind, context * 3 // 4, depth, base.sampling.seed, server, budget
                             )
@@ -637,6 +715,7 @@ class JobManager:
                     self.release(job_id, server, artifact, name)
 
     def capability(self, job_id, artifact, server, case, context, rep, smoke):
+        artifact.phase("Capability", current_context=context, current_test=case["id"], current_repeat=rep + 1)
         self.update(job_id, progress=f"Capability: {case['id']}, context {context}, repeat {rep + 1}")
         budget = case.get("max_tokens") or min(
             server.config.sampling.token_budget, 128 if smoke else context // 4
@@ -645,13 +724,7 @@ class JobManager:
         if case.get("tools"):
             payload["tools"] = case["tools"]
         result = server.request(payload)
-        grade = (
-            score(result["response"], case["rule"], result.get("tool_calls"))
-            if result["success"]
-            else {"score": 0, "passed": False, "detail": result.get("error") or "Inference failed"}
-        )
-        if result.get("finish_reason") == "length":
-            grade = {"score": 0, "passed": False, "detail": "Token budget exhausted (truncated response)"}
+        result.update(grade_result(result, case["rule"]))
         result.update(
             {
                 "type": "capability",
@@ -660,7 +733,6 @@ class JobManager:
                 "test": case,
                 "test_sha256": digest(case),
                 "prompt_sha256": digest(case["messages"]),
-                "grade": grade,
                 "context_size": context,
                 "repeat": rep,
                 "runtime_config": server.config.model_dump(),
