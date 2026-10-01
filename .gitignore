@@ -16,6 +16,10 @@ __pycache__/
 dist/
 build/
 .env
+.env.*
+!.env.example
+!.env.sample
+*.log
 .kilo/
 node_modules/
 *.zip

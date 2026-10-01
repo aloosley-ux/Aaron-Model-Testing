@@ -78,10 +78,23 @@ v0.1.1 uses **agent-core-v1.1**: unchanged v1 questions, rules, interpreter, per
 
 ## Development
 
+Use Python 3.12+ and the existing project-local virtual environment. Dependency versions are preserved in `requirements.lock.txt` and the optional UI `package-lock.json`. The launcher installs Python dependencies without needing global Python packages; optional UI dependencies use `npm ci` below. Read [AGENTS.md](AGENTS.md) and the task; [TASK.md](TASK.md) is an optional reusable contract. Work on a feature branch and preserve unrelated local changes.
+
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m ruff check aaron_model_testing tests
+.\scripts\check.ps1     # dependencies, Ruff, pytest (including frozen benchmark checks)
+.\scripts\validate.ps1  # isolated real HTTP inventory/profile workflow and restart/cleanup
 ```
+
+Validation uses the actual API and static assets, a tiny generated metadata fixture, OS-assigned loopback ports and a unique ignored `.local/validation/<id>/` directory. It checks durable model/profile files, persistence after restart, worker/data-lock shutdown, released HTTP ports and unchanged existing listener ownership on 1234/1235/4321. It does not use `AMT_DATA_DIR` or the user's model roots, launch inference, or alter an existing app. The retained `validation.json` records pass/fail and evidence; failed attempts are retained too. No GPU, native runtime, Node, credentials or external network access is needed. If execution policy blocks these wrappers, run their underlying commands directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m ruff check aaron_model_testing tests scripts
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m scripts.validate_product
+```
+
+For runtime changes, also run **PIPELINE SMOKE TEST** with a real model on the target hardware, inspect artifacts, test cancellation/shutdown and prove 1235 releases while Cortana's PID/creation time stays unchanged. See [validation](docs/VALIDATION.md) and [hardware verification](docs/HARDWARE_VERIFICATION.md). Automated HTTP validation does not establish GPU acceleration or benchmark accuracy.
 
 Optional frontend DOM checks against a running app with inventory/results:
 
