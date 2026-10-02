@@ -71,7 +71,7 @@ def objective(summary: dict, name: str):
     return gen if name == "FAST" else 1 / (256 / prompt + 128 / gen)
 
 
-OPTIMISER_VERSION = "capability-guarded-tuning-v1"
+OPTIMISER_VERSION = "capability-guarded-tuning-v2"
 
 
 def objective_components(summary, name, guardrail, baseline, context):

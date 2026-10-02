@@ -573,6 +573,34 @@ def test_objective_separate_from_name_and_balanced_rejects_faster_regression(
         assert not any(r["type"] == "tuning_guardrail" for r in run["records"])
 
 
+def test_quick_optimise_prunes_partial_offload_after_stable_full_gpu_baseline(client):
+    profile = new_profile(client)
+    job = client.post(
+        "/api/runs",
+        json={
+            "model_id": "model",
+            "profile_id": profile["id"],
+            "stage": "optimise",
+            "preset": "quick",
+            "candidate_limit": 8,
+            "optimisation_objective": "BALANCED",
+        },
+    ).json()
+    final = wait_job(client, job["id"])
+    assert final["status"] == "completed", final
+    run = client.get("/api/runs/" + final["run_id"]).json()
+    report = run["optimisation_report"]
+    assert report["pruning"]["full_gpu_baseline_proven"] is True
+    assert report["candidates_pruned"] >= 1
+    assert report["candidates_tested"] + report["candidates_pruned"] == report["candidates_planned"]
+    assert all(command["config"]["gpu_layers"] == 999 for command in run["commands"])
+    assert all(
+        item["reason"] == "partial_offload_pruned_after_stable_full_gpu_baseline"
+        for item in report["pruning"]["pruned"]
+    )
+
+
+
 def test_smart_measures_stronger_reasoning_checks_and_explores_thinking(client, monkeypatch):
     from aaron_model_testing.tuning_guardrails import SMART_TASKS
 

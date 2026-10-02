@@ -579,15 +579,38 @@ class JobManager:
         results = []
         artifact.record["optimisation_objective"] = objective_name
         artifact.record["save_winner_as"] = request.profile_name
-        artifact.record["planned_samples"] = len(options) * request.repeats * (1 + len(tasks))
+        per_candidate_samples = request.repeats * (1 + len(tasks))
+        artifact.record["planned_samples"] = len(options) * per_candidate_samples
+        artifact.record["optimisation_pruning"] = {
+            "policy": "quick_full_gpu_baseline_v1",
+            "enabled": request.preset == "quick" and objective_name in ("FAST", "BALANCED"),
+            "pruned": [],
+        }
         write_json(
             artifact.path / "tuning-guardrails.json",
             {"version": GUARDRAIL_VERSION, "tasks": tasks, "unscored": True},
         )
         artifact.save()
+        prune_partial_after_baseline = False
         for i, config in enumerate(options):
             if cancel.is_set():
                 raise InterruptedError("Optimisation cancelled")
+            if (
+                i > 0
+                and prune_partial_after_baseline
+                and config.gpu_layers < base.gpu_layers
+            ):
+                entry = {
+                    "candidate": i + 1,
+                    "gpu_layers": config.gpu_layers,
+                    "reason": "partial_offload_pruned_after_stable_full_gpu_baseline",
+                }
+                artifact.record["optimisation_pruning"]["pruned"].append(entry)
+                artifact.record["planned_samples"] = max(
+                    0, artifact.record["planned_samples"] - per_candidate_samples
+                )
+                artifact.save()
+                continue
             name = f"candidate-{i + 1:03d}"
             self.update(
                 job_id,
@@ -706,6 +729,16 @@ class JobManager:
             results.append(result)
             if i == 0:
                 baseline = result
+                prune_partial_after_baseline = (
+                    request.preset == "quick"
+                    and objective_name in ("FAST", "BALANCED")
+                    and base.gpu_layers >= 999
+                    and result["stable"]
+                    and result["eligible"]
+                )
+                artifact.record["optimisation_pruning"]["full_gpu_baseline_proven"] = (
+                    prune_partial_after_baseline
+                )
             key = selection_key(components)
             if key is not None and (best_key is None or key > best_key):
                 best = result
@@ -748,6 +781,10 @@ class JobManager:
             "candidates_planned": len(
                 json.loads((artifact.path / "candidate-plan.json").read_text(encoding="utf-8"))
             ),
+            "candidates_pruned": len(
+                artifact.record.get("optimisation_pruning", {}).get("pruned", [])
+            ),
+            "pruning": artifact.record.get("optimisation_pruning", {}),
             "candidates": [
                 {
                     "candidate": r["candidate"],
